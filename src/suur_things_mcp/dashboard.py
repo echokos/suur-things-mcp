@@ -400,14 +400,19 @@ async def _link_post(request: Request) -> JSONResponse:
 # --- Writes (task editing requires THINGS_AUTH_TOKEN) ----------------------
 
 async def _update(request: Request) -> JSONResponse:
-    token = _auth_token()
-    if not token:
-        return JSONResponse({"ok": False, "error": "THINGS_AUTH_TOKEN not set"})
     body = await _json_body(request)
     if body is None:
         return JSONResponse({"ok": False, "error": "invalid JSON body"}, status_code=400)
-    if not body.get("id"):
+    params = _update_params(body)
+    if params is None:
         return JSONResponse({"ok": False, "error": "missing id"})
+    return await _apply_update(params)
+
+
+def _update_params(body: dict[str, Any]) -> dict[str, Any] | None:
+    """Translate the narrow dashboard update schema into Things URL parameters."""
+    if not body.get("id"):
+        return None
     params: dict[str, Any] = {"id": str(body["id"])}
     for key in ("title", "notes", "when", "deadline"):
         if body.get(key) is not None:
@@ -426,9 +431,20 @@ async def _update(request: Request) -> JSONResponse:
         params["list-id"] = body["list_id"]   # move a to-do to a project/area (⌘K "Move to project")
     if body.get("heading") is not None:
         params["heading"] = body["heading"]   # move a to-do under a heading within its project (drag onto a heading)
+    return params
+
+
+async def _apply_update(params: dict[str, Any]) -> JSONResponse:
+    """One authenticated, idempotency-guarded (middleware), readback-verified write path."""
+    token = _auth_token()
+    if not token:
+        return JSONResponse({"ok": False, "error": "THINGS_AUTH_TOKEN not set"})
     try:
         await run_in_threadpool(lambda: execute("update", params, auth_token=token))
-        return JSONResponse({"ok": True})
+        verified = await run_in_threadpool(reads.get, str(params["id"]))
+        if verified is None:
+            return JSONResponse({"ok": True, "applied": False, "warning_unverified": "verify with get_item"})
+        return JSONResponse({"ok": True, "applied": True})
     except ThingsURLError as exc:
         return JSONResponse({"ok": False, "error": str(exc)})
 
@@ -689,14 +705,49 @@ async def _organize_post(_request: Request) -> JSONResponse:
 
 
 async def _grace_propose(request: Request) -> JSONResponse:
-    """Create a non-executing Grace proposal; a separate authenticated write confirms it."""
+    """Send a bounded proposal to Grace; only a later authenticated confirm can write."""
     body = await _json_body(request)
     if body is None:
         return JSONResponse({"ok": False, "error": "invalid JSON body"}, status_code=400)
     try:
-        return JSONResponse({"ok": True, "proposal": _GRACE.propose(body)})
+        proposal = _GRACE.propose(body)
+        try:
+            await run_in_threadpool(_dispatch_grace_request, _GRACE.request_payload(body))
+        except RuntimeError as exc:
+            _GRACE.discard(proposal["id"])
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+        return JSONResponse({"ok": True, "proposal": proposal})
     except ValueError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+def _dispatch_grace_request(payload: str) -> None:
+    """Deliver a proposal to the configured Hermes/Grace server, never via a shell."""
+    endpoint = os.environ.get("SUUR_HERMES_GRACE_URL")
+    if not endpoint:
+        raise RuntimeError("SUUR_HERMES_GRACE_URL is not configured")
+    token = os.environ.get("SUUR_HERMES_GRACE_TOKEN")
+    headers = {"Content-Type": "application/json", "X-Suur-Source": "dashboard"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(endpoint, data=payload.encode("utf-8"), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            if not 200 <= response.status < 300:
+                raise RuntimeError(f"Hermes/Grace rejected the proposal ({response.status})")
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("Hermes/Grace request delivery failed") from exc
+
+
+async def _grace_confirm(request: Request) -> JSONResponse:
+    """Consume an explicit confirmation and apply the bounded change through _apply_update."""
+    body = await _json_body(request)
+    if body is None:
+        return JSONResponse({"ok": False, "error": "invalid JSON body"}, status_code=400)
+    change = _GRACE.confirmed_change(str(body.get("id") or ""), body.get("confirmation"))
+    if change is None:
+        return JSONResponse({"ok": False, "error": "invalid or expired Grace confirmation"}, status_code=409)
+    return await _apply_update(change)
 
 
 async def _organize_get(request: Request) -> JSONResponse:
@@ -726,6 +777,7 @@ def create_app(port: int = DEFAULT_PORT, security_store: SecurityStore | None = 
             Route("/api/organize", _organize_get),
             Route("/api/organize", _organize_post, methods=["POST"]),
             Route("/api/grace/propose", _grace_propose, methods=["POST"]),
+            Route("/api/grace/confirm", _grace_confirm, methods=["POST"]),
             Route("/api/sidebar", _sidebar),
             Route("/api/items", _items),
             Route("/api/item", _item),
@@ -852,16 +904,13 @@ def _service_plist_path() -> str:
 
 
 def _service_command() -> list[str]:
-    """The command the service runs. Prefer `uvx` (a stable binary that resolves
-    the latest installed release each start); fall back to the current
-    interpreter, whose path may be an ephemeral uvx env — fine for uv tool /
-    pipx / venv installs."""
-    uvx = shutil.which("uvx")
-    if uvx:
-        return [uvx, "suur-things-mcp", "dashboard", "--no-open"]
-    import sys
+    """The LaunchAgent always executes the installed, fixed private venv binary.
 
-    return [sys.executable, "-m", "suur_things_mcp", "dashboard", "--no-open"]
+    Resolving ``uvx`` at every launch would make a KeepAlive service silently
+    change versions, including after an unrelated tool-cache update.
+    """
+    executable = os.path.expanduser("~/Library/Application Support/SUUR Things MCP/venv/bin/suur-things-mcp")
+    return [executable, "dashboard", "--no-open"]
 
 
 def _service_plist(cmd: list[str]) -> str:
@@ -899,13 +948,17 @@ def install_service() -> int:
             "--install-service."
         )
         return 1
+    command = _service_command()
+    if not os.path.isfile(command[0]) or not os.access(command[0], os.X_OK):
+        print("Fixed SUUR virtualenv is missing; run scripts/install_private_tailscale_serve.sh first.")
+        return 1
     uid = os.getuid()
     # Replace an existing installation cleanly (ignore bootout failures).
     subprocess.run(["launchctl", "bootout", f"gui/{uid}/{_SERVICE_LABEL}"],
                    capture_output=True, text=True)
     os.makedirs(os.path.dirname(plist), exist_ok=True)
     with open(plist, "w", encoding="utf-8") as f:
-        f.write(_service_plist(_service_command()))
+        f.write(_service_plist(command))
     r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", plist],
                        capture_output=True, text=True)
     if r.returncode != 0:

@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import os
 import sqlite3
+import stat
 
 import pytest
 from starlette.testclient import TestClient
 
+from suur_things_mcp import dashboard, server
 from suur_things_mcp.dashboard import create_app
 from suur_things_mcp.grace_adapter import GraceProposalAdapter
 from suur_things_mcp.security import SecurityStore, sanitize_for_log
@@ -90,12 +95,32 @@ def test_dashboard_uses_secure_revocable_scoped_session_with_csrf(tmp_path, monk
     csrf = client.cookies.get("__Host-suur-csrf")
     assert csrf and client.get("/api/sidebar").status_code == 200
 
+    grace_requests = []
+    applied = []
+    monkeypatch.setattr(dashboard, "_dispatch_grace_request", lambda payload: grace_requests.append(json.loads(payload)))
+    monkeypatch.setattr(
+        dashboard,
+        "execute",
+        lambda command, params, auth_token=None: applied.append((command, params, auth_token)),
+    )
+    monkeypatch.setattr(dashboard, "_auth_token", lambda: "things-auth")
+    monkeypatch.setattr(dashboard.reads, "get", lambda item_id: {"id": item_id})
     proposal = client.post(
         "/api/grace/propose",
         json={"id": "todo-1", "title": "untrusted <instructions>"},
         headers={"X-Suur-CSRF": csrf},
     )
     assert proposal.status_code == 200 and proposal.json()["proposal"]["mutation_performed"] is False
+    assert grace_requests == [{"profile": "grace", "task_data": {"id": "todo-1", "title": "untrusted <instructions>"}}]
+
+    proposed = proposal.json()["proposal"]
+    confirmed = client.post(
+        "/api/grace/confirm",
+        json={"id": proposed["id"], "confirmation": proposed["confirmation"]},
+        headers={"X-Suur-CSRF": csrf, "Idempotency-Key": "grace-confirm-1"},
+    )
+    assert confirmed.status_code == 200 and confirmed.json() == {"ok": True, "applied": True}
+    assert applied == [("update", {"id": "todo-1", "title": "untrusted <instructions>"}, "things-auth")]
 
     revoked = client.post("/api/session/revoke", headers={"X-Suur-CSRF": csrf, "Idempotency-Key": "revoke-1"})
     assert revoked.status_code == 200
@@ -105,3 +130,50 @@ def test_dashboard_uses_secure_revocable_scoped_session_with_csrf(tmp_path, monk
 def test_dashboard_rejects_untrusted_host(tmp_path):
     client = TestClient(create_app(security_store=SecurityStore(tmp_path / "security.sqlite")), base_url="https://evil.example")
     assert client.get("/api/healthz").status_code == 400
+
+
+def test_move_scope_discovers_only_constrained_move_tool_schema():
+    """A move grant is not a back door to every update_todo field."""
+    tools = asyncio.run(server._filtered_mcp_tools({"move"}))
+    assert [tool.name for tool in tools] == ["move_todo"]
+    schema = tools[0].inputSchema
+    assert set(schema["properties"]) == {"id", "list_title", "list_id", "heading"}
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [
+        (
+            "read",
+            {
+                "get_today", "get_inbox", "get_upcoming", "get_anytime", "get_someday", "get_logbook",
+                "get_deadlines", "get_trash", "search_todos", "list_todos", "get_projects", "get_areas",
+                "get_tags", "get_item", "overview", "show",
+            },
+        ),
+        ("create", {"add_todo", "add_project"}),
+        ("update", {"update_todo", "update_project"}),
+        ("complete", {"complete_todo"}),
+        ("move", {"move_todo"}),
+        ("schedule", {"schedule_todo"}),
+        ("checklist", {"add_checklist_items"}),
+    ],
+)
+def test_each_mcp_scope_has_exact_post_filter_discovery_and_schemas(scope, expected):
+    tools = asyncio.run(server._filtered_mcp_tools({scope}))
+    assert {tool.name for tool in tools} == expected
+    assert all(tool.inputSchema.get("type") == "object" for tool in tools)
+    if scope != "update":
+        assert "update_todo" not in {tool.name for tool in tools}
+
+
+def test_security_store_enforces_private_directory_and_database_modes(tmp_path):
+    path = tmp_path / "nested" / "security.sqlite"
+    previous_umask = os.umask(0)
+    try:
+        SecurityStore(path)
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600

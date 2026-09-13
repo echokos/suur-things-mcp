@@ -38,7 +38,7 @@ class GraceProposalAdapter:
     profile = "grace"
 
     def __init__(self) -> None:
-        self._pending: dict[str, str] = {}
+        self._pending: dict[str, tuple[str, dict[str, str]]] = {}
 
     def propose(self, item: dict[str, Any]) -> dict[str, Any]:
         # Whitelist the small UI schema; never interpolate task notes into commands.
@@ -47,14 +47,25 @@ class GraceProposalAdapter:
             raise ValueError("proposal requires an item id")
         proposal_id = secrets.token_hex(16)
         confirmation = secrets.token_urlsafe(24)
-        self._pending[proposal_id] = hashlib.sha256(confirmation.encode()).hexdigest()
+        self._pending[proposal_id] = (hashlib.sha256(confirmation.encode()).hexdigest(), change)
         return GraceProposal(proposal_id, confirmation, self.profile, change).as_dict()
 
     def confirm(self, proposal_id: str, confirmation: str | None) -> bool:
-        expected = self._pending.pop(proposal_id, None)
-        if not expected or not confirmation:
-            return False
-        return secrets.compare_digest(expected, hashlib.sha256(confirmation.encode()).hexdigest())
+        return self.confirmed_change(proposal_id, confirmation) is not None
+
+    def confirmed_change(self, proposal_id: str, confirmation: str | None) -> dict[str, str] | None:
+        """Consume a matching confirmation and return its bounded Things change."""
+        pending = self._pending.pop(proposal_id, None)
+        if not pending or not confirmation:
+            return None
+        expected, change = pending
+        if not secrets.compare_digest(expected, hashlib.sha256(confirmation.encode()).hexdigest()):
+            return None
+        return dict(change)
+
+    def discard(self, proposal_id: str) -> None:
+        """Forget an undisclosed proposal when delivery to Grace was not possible."""
+        self._pending.pop(proposal_id, None)
 
     @staticmethod
     def request_payload(item: dict[str, Any]) -> str:

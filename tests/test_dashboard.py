@@ -760,10 +760,22 @@ def test_service_plist_generation():
     from suur_things_mcp import dashboard as dash
     cmd = dash._service_command()
     assert cmd[-2:] == ["dashboard", "--no-open"]
+    assert cmd[0].endswith("/venv/bin/suur-things-mcp")
+    assert "uvx" not in cmd[0]
     plist = dash._service_plist(cmd)
     assert f"<string>{dash._SERVICE_LABEL}</string>" in plist
     assert "<key>KeepAlive</key><true/>" in plist
     assert "token" not in plist.lower()
+
+
+def test_private_tailscale_serve_install_script_exists():
+    from pathlib import Path
+
+    script = Path(__file__).parents[1] / "scripts" / "install_private_tailscale_serve.sh"
+    text = script.read_text(encoding="utf-8")
+    assert "tailscale serve --https=443" in text
+    assert "127.0.0.1" in text
+    assert "SUUR_DASHBOARD_PORT" in text
 
 
 def test_install_service_refuses_foreign_dashboard(monkeypatch, capsys):

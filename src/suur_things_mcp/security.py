@@ -43,8 +43,13 @@ class SecurityStore:
         self.path = Path(path)
         self.rate_limit = rate_limit
         self.rate_window_seconds = rate_window_seconds
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # mkdir and SQLite creation both honor the caller's umask, which may be
+        # deliberately permissive in a service manager. Tighten existing and new
+        # paths explicitly before accepting any secrets.
+        os.chmod(self.path.parent, 0o700)
         self._init()
+        os.chmod(self.path, 0o600)
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.path)

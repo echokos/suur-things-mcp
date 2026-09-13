@@ -350,6 +350,28 @@ def update_todo(
 
 
 @mcp.tool()
+def move_todo(
+    id: Annotated[str, Field(description="UUID of the to-do to move.")],
+    list_title: Annotated[str | None, Field(description="Destination project/area by title.")] = None,
+    list_id: Annotated[str | None, Field(description="Destination project/area by UUID (wins over list_title).")] = None,
+    heading: Annotated[str | None, Field(description="Destination heading within the project.")] = None,
+) -> dict[str, Any]:
+    """Move an existing to-do without changing any other task field.
+
+    Requires THINGS_AUTH_TOKEN. This deliberately has no title, note, scheduling,
+    tag, checklist, completion, or cancellation parameters, so a ``move`` scope
+    cannot be used as a broad update capability.
+    """
+    if not any((list_title, list_id, heading)):
+        return {"ok": False, "error": "a destination list or heading is required"}
+    return _do_update(
+        "update",
+        {"id": id, "list": list_title, "list-id": list_id, "heading": heading},
+        uuid=id,
+    )
+
+
+@mcp.tool()
 def update_project(
     id: Annotated[str, Field(description="UUID of the project to modify.")],
     title: str | None = None,
@@ -1035,20 +1057,26 @@ def main() -> None:
         from .security import default_store
 
         scopes = default_store().mcp_scopes(os.environ.get("SUUR_MCP_PROFILE", ""), os.environ.get("SUUR_MCP_TOKEN"))
-        grants = {
-            "read": {"get_today", "get_inbox", "get_upcoming", "get_anytime", "get_someday", "get_logbook", "get_deadlines", "get_trash", "search_todos", "list_todos", "get_projects", "get_areas", "get_tags", "get_item", "overview", "show"},
-            "create": {"add_todo", "add_project"},
-            "update": {"update_todo", "update_project"},
-            "complete": {"complete_todo"},
-            "move": {"update_todo"},
-            "schedule": {"schedule_todo"},
-            "checklist": {"add_checklist_items"},
-        }
-        allowed = set().union(*(grants.get(scope, set()) for scope in scopes))
-        for tool in asyncio.run(mcp.list_tools()):
-            if tool.name not in allowed:
-                mcp.remove_tool(tool.name)
+        for tool in asyncio.run(_filtered_mcp_tools(scopes, include_disallowed=True)):
+            mcp.remove_tool(tool.name)
         mcp.run()
+
+
+_MCP_SCOPE_TOOLS = {
+    "read": {"get_today", "get_inbox", "get_upcoming", "get_anytime", "get_someday", "get_logbook", "get_deadlines", "get_trash", "search_todos", "list_todos", "get_projects", "get_areas", "get_tags", "get_item", "overview", "show"},
+    "create": {"add_todo", "add_project"},
+    "update": {"update_todo", "update_project"},
+    "complete": {"complete_todo"},
+    "move": {"move_todo"},
+    "schedule": {"schedule_todo"},
+    "checklist": {"add_checklist_items"},
+}
+
+
+async def _filtered_mcp_tools(scopes: set[str] | frozenset[str], *, include_disallowed: bool = False) -> list[Any]:
+    """Return the post-scope-filter discovery set (or its complement for startup)."""
+    allowed = set().union(*(_MCP_SCOPE_TOOLS.get(scope, set()) for scope in scopes))
+    return [tool for tool in await mcp.list_tools() if (tool.name not in allowed) == include_disallowed]
 
 
 if __name__ == "__main__":
