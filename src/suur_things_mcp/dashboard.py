@@ -1010,14 +1010,14 @@ def _service_plist_path() -> str:
     return os.path.expanduser(f"~/Library/LaunchAgents/{_SERVICE_LABEL}.plist")
 
 
-def _service_command() -> list[str]:
+def _service_command(port: int = DEFAULT_PORT) -> list[str]:
     """The LaunchAgent always executes the installed, fixed private venv binary.
 
     Resolving ``uvx`` at every launch would make a KeepAlive service silently
     change versions, including after an unrelated tool-cache update.
     """
     executable = os.path.expanduser("~/Library/Application Support/SUUR Things MCP/venv/bin/suur-things-mcp")
-    return [executable, "dashboard", "--no-open"]
+    return [executable, "dashboard", "--no-open", "--strict-port", "--port", str(port)]
 
 
 def _service_plist(cmd: list[str]) -> str:
@@ -1027,9 +1027,14 @@ def _service_plist(cmd: list[str]) -> str:
         os.environ.get("SUUR_SECRET_DIR", "~/.config/suur-things-mcp/secrets")
     )
     tailscale_users = os.environ.get("SUUR_TAILSCALE_USERS", "")
+    grace_url = os.environ.get("SUUR_HERMES_GRACE_URL", "")
     environment = "\n".join(
         f"    <key>{name}</key><string>{escape(value)}</string>"
-        for name, value in (("SUUR_SECRET_DIR", secret_dir), ("SUUR_TAILSCALE_USERS", tailscale_users))
+        for name, value in (
+            ("SUUR_SECRET_DIR", secret_dir),
+            ("SUUR_TAILSCALE_USERS", tailscale_users),
+            ("SUUR_HERMES_GRACE_URL", grace_url),
+        )
     )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1053,21 +1058,21 @@ def _service_plist(cmd: list[str]) -> str:
 """
 
 
-def install_service() -> int:
+def install_service(port: int = DEFAULT_PORT) -> int:
     """Write + load the LaunchAgent. Returns a process exit code."""
     plist = _service_plist_path()
     # A live dashboard NOT started by our agent means some other supervisor
-    # (e.g. a hand-rolled LaunchAgent) owns port 8765. Installing a second
+    # (e.g. a hand-rolled LaunchAgent) owns the configured port. Installing a second
     # KeepAlive service would make the two fight over the port forever.
-    if _dashboard_alive(DEFAULT_PORT) and not os.path.exists(plist):
+    if _dashboard_alive(port) and not os.path.exists(plist):
         print(
-            f"A dashboard is already running on :{DEFAULT_PORT} but wasn't started by "
+            f"A dashboard is already running on :{port} but wasn't started by "
             f"this service ({_SERVICE_LABEL}).\nIf you manage it with your own "
             "launchd agent, keep using that — or unload it first, then re-run "
             "--install-service."
         )
         return 1
-    command = _service_command()
+    command = _service_command(port)
     if not os.path.isfile(command[0]) or not os.access(command[0], os.X_OK):
         print("Fixed SUUR virtualenv is missing; run scripts/install_private_tailscale_serve.sh first.")
         return 1
@@ -1085,7 +1090,7 @@ def install_service() -> int:
         return 1
     print(f"Installed + started {_SERVICE_LABEL}")
     print(f"  plist : {plist}")
-    print(f"  board : http://127.0.0.1:{DEFAULT_PORT}")
+    print(f"  board : http://127.0.0.1:{port}")
     print("  note  : for write access, keep your token in "
           "~/.config/suur-things-mcp/token (chmod 600) — the service reads it "
           "from there; no secret is stored in the plist.")
@@ -1104,7 +1109,9 @@ def uninstall_service() -> int:
     return 0
 
 
-def serve_foreground(port: int = DEFAULT_PORT, open_browser: bool = True, app_mode: bool = False) -> None:
+def serve_foreground(
+    port: int = DEFAULT_PORT, open_browser: bool = True, app_mode: bool = False, strict_port: bool = False
+) -> None:
     if _dashboard_alive(port):  # already running on the stable port — don't duplicate
         url = f"http://127.0.0.1:{port}"
         print(f"Things dashboard already running → {url}")
@@ -1113,6 +1120,8 @@ def serve_foreground(port: int = DEFAULT_PORT, open_browser: bool = True, app_mo
         return
     chosen = _pick_port(port)
     if chosen != port:
+        if strict_port:
+            raise RuntimeError(f"Configured dashboard port {port} is busy; refusing to change the private proxy target")
         print(f"Port {port} is busy (not our dashboard); using {chosen} instead.")
     url = f"http://127.0.0.1:{chosen}"
     print(f"Things dashboard → {url}  ({'app window' if app_mode else 'browser'}; Ctrl-C to stop)")

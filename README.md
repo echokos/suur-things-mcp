@@ -219,11 +219,12 @@ The GTD and code/GitHub prompts use only the existing tools (plus the agent's ow
 
 ## Dashboard
 
-A local web UI that mirrors the Things look (real glyphs, typography, edit card) and adds the views Things lacks. Binds `127.0.0.1` only, reads the DB read-only, and **always runs on port 8765** (it reuses a live instance instead of spawning duplicates).
+A local web UI that mirrors the Things look (real glyphs, typography, edit card) and adds the views Things lacks. It binds `127.0.0.1` only, reads the DB read-only, and defaults to port 8765. Use `--port` to choose a different local port; persistent Tailscale deployments must keep that port identical in the LaunchAgent and `tailscale serve` target.
 
 ```bash
 uvx suur-things-mcp dashboard        # opens http://127.0.0.1:8765 in your browser
 uvx suur-things-mcp dashboard --app  # opens it in a frameless app window (no tabs/toolbar)
+uvx suur-things-mcp dashboard --port 8766  # choose a different loopback port
 uvx suur-things-mcp dashboard --install-service   # always-on: launchd KeepAlive service at login
 uvx suur-things-mcp dashboard --uninstall-service # remove the service again
 ```
@@ -274,6 +275,8 @@ Three tiers — important if you switch machines:
 | `SUUR_THINGS_CONFIG` | Override the `board.json` path |
 | `SUUR_THINGS_EDITOR` / `SUUR_THINGS_TERMINAL` | Default editor command / terminal app for repo-launch buttons |
 | `SUUR_THINGS_AGENT` | Which CLI the ✨ organize button spawns (`claude` / `codex`) |
+| `SUUR_DASHBOARD_PORT` | Port used by `scripts/install_private_tailscale_serve.sh` for both the LaunchAgent and Tailscale Serve target (default `8765`) |
+| `SUUR_HERMES_GRACE_URL` | Required HTTPS private Grace proposal ingress URL for the hardened installer; persisted as non-secret service configuration |
 
 ---
 

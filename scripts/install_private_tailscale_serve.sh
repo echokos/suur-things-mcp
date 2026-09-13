@@ -13,6 +13,12 @@ SUUR_DASHBOARD_PORT=${SUUR_DASHBOARD_PORT:-8765}
 SUUR_VENV=${SUUR_VENV:-"$HOME/Library/Application Support/SUUR Things MCP/venv"}
 VENV_PARENT=$(dirname "$SUUR_VENV")
 SUUR_SECRET_DIR=${SUUR_SECRET_DIR:-"$HOME/.config/suur-things-mcp/secrets"}
+SUUR_HERMES_GRACE_URL=${SUUR_HERMES_GRACE_URL:?Set SUUR_HERMES_GRACE_URL to the private HTTPS Grace proposal ingress.}
+
+case "$SUUR_HERMES_GRACE_URL" in
+    https://*) ;;
+    *) printf '%s\n' 'SUUR_HERMES_GRACE_URL must use HTTPS.' >&2; exit 1 ;;
+esac
 
 command -v uv >/dev/null 2>&1 || { printf '%s\n' 'uv is required.' >&2; exit 1; }
 command -v tailscale >/dev/null 2>&1 || { printf '%s\n' 'Tailscale is required.' >&2; exit 1; }
@@ -54,7 +60,7 @@ fi
     printf '%s\n' 'Could not derive a Tailscale browser identity; set SUUR_TAILSCALE_USERS and re-run.' >&2
     exit 1
 }
-export SUUR_SECRET_DIR SUUR_TAILSCALE_USERS
+export SUUR_SECRET_DIR SUUR_TAILSCALE_USERS SUUR_HERMES_GRACE_URL
 
 # `uv sync --locked` produces the exact dependency graph committed with this
 # checkout. The fixed service path below is a stable symlink to that venv; it is
@@ -62,7 +68,7 @@ export SUUR_SECRET_DIR SUUR_TAILSCALE_USERS
 uv sync --locked --no-dev --project "$PROJECT_DIR"
 mkdir -p "$VENV_PARENT"
 ln -sfn "$PROJECT_DIR/.venv" "$SUUR_VENV"
-"$SUUR_VENV/bin/suur-things-mcp" dashboard --install-service
+"$SUUR_VENV/bin/suur-things-mcp" dashboard --install-service --port "$SUUR_DASHBOARD_PORT"
 
 # Tailscale Serve terminates HTTPS inside this tailnet and proxies to loopback.
 # Do not replace this with Funnel or a LAN/WAN bind.

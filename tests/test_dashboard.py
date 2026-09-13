@@ -72,7 +72,7 @@ def test_dashboard_no_open_flag_suppresses_browser(monkeypatch):
     monkeypatch.setattr(dash, "serve_foreground", lambda **kw: captured.update(kw))
     monkeypatch.setattr(sys, "argv", ["suur-things-mcp", "dashboard", "--no-open"])
     server.main()
-    assert captured == {"app_mode": False, "open_browser": False}
+    assert captured == {"port": 8765, "app_mode": False, "open_browser": False, "strict_port": False}
 
 
 def test_dashboard_default_opens_browser(monkeypatch):
@@ -756,10 +756,10 @@ def test_softrefresh_gates_on_cursor():
 def test_service_plist_generation():
     """--install-service writes a KeepAlive LaunchAgent that runs the dashboard
     headless. No secrets may appear in the plist (the token lives in the config
-    dir); the command must end with `dashboard --no-open`."""
+    dir); the command must run headlessly and pin the configured service port."""
     from suur_things_mcp import dashboard as dash
     cmd = dash._service_command()
-    assert cmd[-2:] == ["dashboard", "--no-open"]
+    assert cmd[1:] == ["dashboard", "--no-open", "--strict-port", "--port", "8765"]
     assert cmd[0].endswith("/venv/bin/suur-things-mcp")
     assert "uvx" not in cmd[0]
     plist = dash._service_plist(cmd)
@@ -768,6 +768,31 @@ def test_service_plist_generation():
     assert "token" not in plist.lower()
     assert "SUUR_SECRET_DIR" in plist
     assert "SUUR_TAILSCALE_USERS" in plist
+
+
+def test_service_uses_installer_selected_loopback_port_and_private_grace_ingress(monkeypatch):
+    """The Tailscale proxy target and LaunchAgent must agree on one non-default port.
+
+    The private Grace URL is configuration, not a one-off installer-shell value:
+    the service needs it after launchd restarts it.
+    """
+    from suur_things_mcp import dashboard as dash
+
+    monkeypatch.setenv("SUUR_HERMES_GRACE_URL", "https://grace.tailnet.example/api/suur/grace/proposals")
+    cmd = dash._service_command(8766)
+    assert cmd[1:] == ["dashboard", "--no-open", "--strict-port", "--port", "8766"]
+    plist = dash._service_plist(cmd)
+    assert "SUUR_HERMES_GRACE_URL" in plist
+    assert "https://grace.tailnet.example/api/suur/grace/proposals" in plist
+
+
+def test_strict_service_refuses_a_port_change_that_would_break_the_proxy(monkeypatch):
+    from suur_things_mcp import dashboard as dash
+
+    monkeypatch.setattr(dash, "_dashboard_alive", lambda port: False)
+    monkeypatch.setattr(dash, "_pick_port", lambda port: 8767)
+    with pytest.raises(RuntimeError, match="refusing to change the private proxy target"):
+        dash.serve_foreground(port=8766, open_browser=False, strict_port=True)
 
 
 def test_private_tailscale_serve_install_script_exists():
@@ -780,6 +805,8 @@ def test_private_tailscale_serve_install_script_exists():
     assert "SUUR_DASHBOARD_PORT" in text
     assert "SUUR_SECRET_DIR" in text
     assert "grace-shared-key" in text
+    assert "SUUR_HERMES_GRACE_URL" in text
+    assert 'dashboard --install-service --port "$SUUR_DASHBOARD_PORT"' in text
 
 
 def test_install_service_refuses_foreign_dashboard(monkeypatch, capsys):
@@ -799,7 +826,7 @@ def test_main_dispatches_service_flags(monkeypatch):
     from suur_things_mcp import server
 
     called = []
-    monkeypatch.setattr(dash, "install_service", lambda: called.append("install") or 0)
+    monkeypatch.setattr(dash, "install_service", lambda port: called.append(("install", port)) or 0)
     monkeypatch.setattr(dash, "uninstall_service", lambda: called.append("uninstall") or 0)
     monkeypatch.setattr(sys, "argv", ["suur-things-mcp", "dashboard", "--install-service"])
     with pytest.raises(SystemExit):
@@ -807,7 +834,7 @@ def test_main_dispatches_service_flags(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["suur-things-mcp", "dashboard", "--uninstall-service"])
     with pytest.raises(SystemExit):
         server.main()
-    assert called == ["install", "uninstall"]
+    assert called == [("install", 8765), "uninstall"]
 
 # --- motion + UX feature source guards (same style as the quick-add guards) ---
 

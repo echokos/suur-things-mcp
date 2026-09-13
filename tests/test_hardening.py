@@ -5,12 +5,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import importlib.util
 import json
 import logging
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
+import threading
 import time
+import urllib.request
 
 import pytest
 from starlette.testclient import TestClient
@@ -83,6 +88,58 @@ def test_grace_adapter_only_proposes_and_never_exposes_browser_confirmation_capa
     assert proposal["profile"] == "grace"
     assert proposal["mutation_performed"] is False
     assert "confirmation" not in proposal
+
+
+def test_private_grace_ingress_has_a_fixed_local_runtime_contract():
+    """Grace receives signed SUUR proposals through a loopback-only ingress,
+    rather than an unbound generic webhook or an agent shell-out."""
+    script = os.path.join(os.path.dirname(__file__), "..", "scripts", "grace_hermes_ingress.py")
+    result = subprocess.run([sys.executable, script, "--help"], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0
+    assert "--shared-key-file" in result.stdout
+    assert "--spool-dir" in result.stdout
+    assert "127.0.0.1" in result.stdout
+
+
+def test_private_grace_ingress_verifies_and_spools_a_signed_proposal(tmp_path):
+    script = os.path.join(os.path.dirname(__file__), "..", "scripts", "grace_hermes_ingress.py")
+    spec = importlib.util.spec_from_file_location("grace_ingress", script)
+    assert spec and spec.loader
+    ingress = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ingress)
+
+    key_file = tmp_path / "grace-shared-key"
+    key_file.write_text("grace-shared-secret\n", encoding="utf-8")
+    key_file.chmod(0o600)
+    spool_dir = tmp_path / "spool"
+    server = ingress.ThreadingHTTPServer(("127.0.0.1", 0), ingress._handler(ingress._secret(key_file), spool_dir))
+    thread = threading.Thread(target=server.handle_request)
+    thread.start()
+    try:
+        payload = json.dumps(
+            {"profile": "grace", "proposal_id": "proposal-1", "task_data": {"id": "todo-1", "title": "data"}},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        timestamp = str(int(time.time()))
+        signature = hmac.new(b"grace-shared-secret", f"{timestamp}.".encode() + payload, hashlib.sha256).hexdigest()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/api/suur/grace/proposals",
+            data=payload,
+            headers={"X-Suur-Grace-Timestamp": timestamp, "X-Suur-Grace-Signature": signature},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=3) as response:
+            assert response.status == 202
+    finally:
+        thread.join(timeout=3)
+        server.server_close()
+
+    records = list(spool_dir.glob("*.json"))
+    assert len(records) == 1
+    assert stat.S_IMODE(records[0].stat().st_mode) == 0o600
+    assert json.loads(records[0].read_text(encoding="utf-8"))["proposal_id"] == "proposal-1"
 
 
 @pytest.mark.parametrize("uri", ["file:/tmp/thing.sqlite?mode=ro&immutable=1", "file:/tmp/space%20db?mode=ro&immutable=1"])

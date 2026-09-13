@@ -29,7 +29,39 @@ an agent prompt. The installer also writes the `SUUR_TAILSCALE_USERS` allowlist
 into the LaunchAgent from the signed-in Tailscale login, unless an administrator
 overrides it before installation.
 
-## Bind the Grace web-chat workflow
+## Private Grace proposal ingress
+
+Grace's Hermes runtime receives proposals through the checked-in
+`scripts/grace_hermes_ingress.py` service. It binds **only** to `127.0.0.1`,
+verifies the SUUR `timestamp.body` HMAC envelope with the transferred 0600 key,
+rejects stale/invalid/replayed requests, and atomically writes accepted proposal
+JSON to a 0700 local spool. The local Grace workflow consumes that spool as data;
+it must not execute proposal titles, notes, or task content.
+
+On Grace's Mac, run the ingress behind Tailscale Serve (not Funnel or a public
+proxy). This example selects loopback port `8790` for that host:
+
+```sh
+python3 /fixed/suur-checkout/scripts/grace_hermes_ingress.py \
+  --port 8790 \
+  --shared-key-file /path/in/grace-secret-store/grace-shared-key \
+  --spool-dir ~/.config/grace-hermes/suur-proposals
+
+tailscale serve --https=443 http://127.0.0.1:8790
+```
+
+Set `SUUR_HERMES_GRACE_URL` on the Things Mac to the resulting private Tailscale
+HTTPS URL, including the fixed path:
+
+```sh
+export SUUR_HERMES_GRACE_URL=https://grace-host.tailnet.ts.net/api/suur/grace/proposals
+```
+
+The SUUR installer persists this non-secret URL in its LaunchAgent so proposal
+delivery survives restarts. Do not use a generic public webhook, a browser-supplied
+URL, or an agent shell-out as an ingress.
+
+## Bind the Grace web-chat decision workflow
 
 Configure exactly one Grace web-chat decision action with the following fixed
 command shape, replacing only the proposal and decision IDs with values from

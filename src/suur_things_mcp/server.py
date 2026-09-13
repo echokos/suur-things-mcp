@@ -1029,14 +1029,24 @@ def main() -> None:
 
     args = sys.argv[1:]
     if args and args[0] == "dashboard":
+        dashboard_args = args[1:]
+        port = 8765
+        if "--port" in dashboard_args:
+            position = dashboard_args.index("--port")
+            try:
+                port = int(dashboard_args[position + 1])
+            except (IndexError, ValueError):
+                raise SystemExit("dashboard --port requires an integer from 1 through 65535") from None
+            if not 1 <= port <= 65535:
+                raise SystemExit("dashboard --port requires an integer from 1 through 65535")
         # `--install-service` / `--uninstall-service` manage a launchd KeepAlive
         # LaunchAgent that runs `dashboard --no-open` at login (always-on board,
         # no terminal, no browser tab on restarts).
-        if "--install-service" in args[1:]:
+        if "--install-service" in dashboard_args:
             from .dashboard import install_service
 
-            raise SystemExit(install_service())
-        if "--uninstall-service" in args[1:]:
+            raise SystemExit(install_service(port))
+        if "--uninstall-service" in dashboard_args:
             from .dashboard import uninstall_service
 
             raise SystemExit(uninstall_service())
@@ -1044,13 +1054,18 @@ def main() -> None:
 
         # `--app` opens the dashboard in a frameless Chromium app window (no tabs
         # or address bar) instead of a normal browser tab.
-        app_mode = "--app" in args[1:]
+        app_mode = "--app" in dashboard_args
         # `--no-open` runs the dashboard as a quiet background service: bind the
         # port and serve, but never open a browser. Intended for a login agent
         # (launchd/systemd) that keeps the dashboard alive without popping a tab
         # on every (re)start.
-        open_browser = "--no-open" not in args[1:]
-        serve_foreground(app_mode=app_mode, open_browser=open_browser)
+        open_browser = "--no-open" not in dashboard_args
+        serve_foreground(
+            port=port,
+            app_mode=app_mode,
+            open_browser=open_browser,
+            strict_port="--strict-port" in dashboard_args,
+        )
     else:
         # Stdio MCP is deny-by-default. A profile gets only its explicitly
         # provisioned capabilities; omitted/revoked credentials expose reads only.

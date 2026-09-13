@@ -12,7 +12,18 @@ Run `scripts/install_private_tailscale_serve.sh` **locally on the Things Mac**. 
 `uv sync --locked --no-dev`, exposes a fixed service executable at
 `~/Library/Application Support/SUUR Things MCP/venv/bin/suur-things-mcp`, installs the
 LaunchAgent, and configures `tailscale serve --https=443` to proxy only to
-`127.0.0.1:8765`. The LaunchAgent never invokes `uvx` or resolves a package at startup.
+the explicitly selected loopback port. The following selects `8766` (choose one free
+port before installation, then keep the service and proxy on that same value):
+
+```sh
+SUUR_DASHBOARD_PORT=8766 \
+SUUR_HERMES_GRACE_URL=https://grace-host.tailnet.ts.net/api/suur/grace/proposals \
+scripts/install_private_tailscale_serve.sh
+```
+
+The LaunchAgent runs `dashboard --no-open --strict-port --port 8766`; it refuses to
+fall back to a different port because that would detach the private proxy from the
+dashboard. The LaunchAgent never invokes `uvx` or resolves a package at startup.
 
 The installer creates `~/.config/suur-things-mcp/secrets/` with mode 0700 and
 regular 0600 `browser-bootstrap` and `grace-shared-key` files. The LaunchAgent
@@ -47,7 +58,24 @@ The service never shells out to a general agent runner.
 
 ## MCP principals
 
-MCP starts read-only unless both `SUUR_MCP_PROFILE` and `SUUR_MCP_TOKEN` match a provisioned principal in the local security SQLite database. Issue different principals per Hermes profile and only grant needed scopes: `read`, `create`, `update`, `complete`, `move`, `schedule`, or `checklist`. Revoking a principal returns it to read-only discovery at the next process start. Cancel, batch, dashboard-overlay, attachment, repository-link, and generic-organizer tools are never exposed by the hardened MCP startup path.
+MCP starts with no registered mutation tool unless both `SUUR_MCP_PROFILE` and
+`SUUR_MCP_TOKEN` match a provisioned principal in the local security SQLite database.
+Issue different principals per Hermes profile and grant only the exact scopes below.
+Revoking a principal removes every MCP tool from that principal at the next process start.
+
+| Scope | Exact MCP tools exposed | Authorized operation boundary |
+|---|---|---|
+| `read` | `get_today`, `get_inbox`, `get_upcoming`, `get_anytime`, `get_someday`, `get_logbook`, `get_deadlines`, `get_trash`, `search_todos`, `list_todos`, `get_projects`, `get_areas`, `get_tags`, `get_item`, `overview`, `show` | Read/discovery only; `show` only reveals an existing Things item/list. |
+| `create` | `add_todo`, `add_project` | Create a new Things to-do or project only. |
+| `update` | `update_todo`, `update_project` | Modify fields on an existing named item/project through the authenticated URL-scheme path. |
+| `complete` | `complete_todo` | Mark exactly one existing to-do complete. |
+| `move` | `move_todo` | Move exactly one to-do to a destination list/heading; it has no title, note, tag, completion, or schedule fields. |
+| `schedule` | `schedule_todo` | Change scheduling on exactly one existing to-do. |
+| `checklist` | `add_checklist_items` | Append checklist items to exactly one existing to-do. |
+
+Scopes compose only by union of these rows. There is no `admin`, `cancel`, `batch`,
+dashboard-overlay, attachment, repository-link, or generic-organizer scope/tool in
+the hardened MCP startup path.
 
 Provision and revoke with a short local-admin Python session using `SecurityStore.provision_mcp_principal()` and `SecurityStore.revoke_mcp_principal()`; display a newly-issued token once, store it in the host service secret store, and never paste it into an agent prompt or browser.
 
