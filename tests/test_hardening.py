@@ -120,6 +120,50 @@ def test_grace_decision_callback_uses_configured_tailscale_https_port(monkeypatc
         decide._callback(f"https://{host}/api/grace/decision")
 
 
+def test_grace_decision_cli_delivers_to_configured_tailscale_https_port(tmp_path, monkeypatch):
+    """The complete CLI path preserves the private :8443 callback URL to transport."""
+    script = os.path.join(os.path.dirname(__file__), "..", "scripts", "grace_hermes_decide.py")
+    spec = importlib.util.spec_from_file_location("grace_decide_cli", script)
+    assert spec and spec.loader
+    decide = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(decide)
+
+    key_file = tmp_path / "grace-shared-key"
+    key_file.write_text("grace-shared-secret\n", encoding="utf-8")
+    key_file.chmod(0o600)
+    host = "elliotts-mac-mini.tail43b447.ts.net"
+    callback = f"https://{host}:8443/api/grace/decision"
+    sent = []
+
+    class Response:
+        status = 202
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_urlopen(request, *, timeout):
+        sent.append((request.full_url, timeout))
+        return Response()
+
+    monkeypatch.setenv("SUUR_GRACE_CALLBACK_HOST", host)
+    monkeypatch.setenv("SUUR_TAILSCALE_HTTPS_PORT", "8443")
+    monkeypatch.setattr(decide.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "grace_hermes_decide.py", "--proposal-id", "proposal-1", "--decision-id", "decision-1", "--approve",
+            "--callback-url", callback, "--shared-key-file", str(key_file),
+        ],
+    )
+
+    assert decide.main() == 0
+    assert sent == [(callback, 10)]
+
+
 def test_private_grace_ingress_verifies_and_spools_a_signed_proposal(tmp_path):
     script = os.path.join(os.path.dirname(__file__), "..", "scripts", "grace_hermes_ingress.py")
     spec = importlib.util.spec_from_file_location("grace_ingress", script)
