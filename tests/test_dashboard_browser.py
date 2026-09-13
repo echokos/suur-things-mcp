@@ -10,12 +10,13 @@ They skip cleanly when Playwright's Chromium isn't installed, so plain
 browser and runs them for real.
 """
 
-import json
 import socket
 import threading
 import time
+from urllib.parse import urlsplit
 
 import pytest
+from starlette.testclient import TestClient
 
 # Skip the whole module if Playwright (the lib) isn't even importable.
 pytest.importorskip("playwright.sync_api")
@@ -23,7 +24,9 @@ import uvicorn  # noqa: E402
 from playwright.sync_api import Error as PWError  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
+from suur_things_mcp import dashboard  # noqa: E402
 from suur_things_mcp.dashboard import create_app  # noqa: E402
+from suur_things_mcp.security import SecurityStore  # noqa: E402
 
 pytestmark = pytest.mark.browser
 
@@ -133,65 +136,79 @@ def test_page_loads_without_js_exceptions(browser, dashboard_url):
     assert not errors, f"uncaught JS exceptions on load: {errors}"
 
 
-def test_startup_bootstraps_session_before_protected_api_calls(browser, dashboard_url):
-    """The real page must establish its cookie-backed session before config or
-    sidebar reads. Route fulfillment keeps this browser test independent of a
-    local Things database while still exercising the shipped startup script."""
+def _tailscale_dashboard_context(browser, tmp_path, monkeypatch, login):
+    """Serve the real page at the Tailscale HTTPS origin while dispatching API
+    calls through the real ASGI app. This permits Secure __Host cookies in a
+    browser without binding a test TLS listener or requiring Things on Linux."""
+    origin = "https://elliotts-mac-mini.tail43b447.ts.net"
+    monkeypatch.setenv("SUUR_TAILSCALE_USERS", "elliott@example.com")
+    backend = TestClient(create_app(security_store=SecurityStore(tmp_path / "security.sqlite")), base_url=origin)
     context = browser.new_context()
-    calls = []
+    context.set_extra_http_headers({"Tailscale-User-Login": login, "X-Forwarded-Proto": "https"})
+    calls, protected_cookies = [], []
 
-    def api(route):
-        url = route.request.url
-        if url.endswith("/api/session"):
-            calls.append("session")
-            route.fulfill(status=200, content_type="application/json", body=json.dumps({"ok": True}))
-        elif url.endswith("/api/config"):
-            calls.append("config")
-            route.fulfill(status=200, content_type="application/json", body=json.dumps({"ok": True, "config": {"boards": []}}))
-        elif url.endswith("/api/sidebar"):
-            calls.append("sidebar")
-            route.fulfill(
-                status=200,
-                content_type="application/json",
-                body=json.dumps({"ok": True, "auth": False, "sidebar": {"builtins": [], "areas": [], "arealess": []}}),
-            )
-        elif url.endswith("/api/cursor"):
-            calls.append("cursor")
-            route.fulfill(status=200, content_type="application/json", body=json.dumps({"ok": True, "cursor": "test"}))
-        else:
+    def forward(route):
+        request = route.request
+        path = urlsplit(request.url).path
+        if path == "/":
+            route.fulfill(status=200, content_type="text/html", body=dashboard._index_html())
+            return
+        if not path.startswith("/api/"):
             route.abort()
+            return
+        calls.append(path)
+        if path in {"/api/config", "/api/sidebar"}:
+            protected_cookies.append(request.headers.get("cookie", ""))
+        response = backend.request(request.method, path, headers=dict(request.headers), content=request.post_data)
+        if path == "/api/session" and response.status_code == 200:
+            browser_cookies = []
+            for cookie in backend.cookies.jar:
+                if cookie.name in {"__Host-suur-session", "__Host-suur-csrf"}:
+                    browser_cookies.append({
+                        "name": cookie.name,
+                        "value": cookie.value,
+                        "url": origin,
+                        "secure": True,
+                        "httpOnly": cookie.name == "__Host-suur-session",
+                        "sameSite": "Strict",
+                    })
+            context.add_cookies(browser_cookies)
+        route.fulfill(status=response.status_code, content_type="application/json", body=response.text)
 
-    context.route("**/api/**", api)
+    context.route(f"{origin}/**", forward)
+    return origin, backend, context, calls, protected_cookies
+
+
+def test_startup_bootstraps_allowlisted_tailscale_session_before_protected_calls(browser, tmp_path, monkeypatch):
+    """An allowlisted Tailscale browser uses the real bootstrap handler, receives
+    its server-issued Secure cookies, then sends them on config/sidebar reads."""
+    origin, backend, context, calls, protected_cookies = _tailscale_dashboard_context(
+        browser, tmp_path, monkeypatch, "elliott@example.com"
+    )
     page = context.new_page()
-    page.goto(dashboard_url, wait_until="networkidle")
+    page.goto(origin, wait_until="networkidle")
     page.close()
     context.close()
+    backend.close()
 
-    assert calls[:3] == ["session", "config", "sidebar"]
+    assert calls[:3] == ["/api/session", "/api/config", "/api/sidebar"]
+    assert all("__Host-suur-session=" in cookie and "__Host-suur-csrf=" in cookie for cookie in protected_cookies)
 
 
-def test_startup_stops_and_shows_error_when_session_is_rejected(browser, dashboard_url):
-    """An unauthenticated browser gets a visible denial, not a dashboard that
-    proceeds into protected endpoints and fails later in unrelated ways."""
-    context = browser.new_context()
-    calls = []
-
-    def api(route):
-        calls.append(route.request.url.rsplit("/", 1)[-1])
-        route.fulfill(
-            status=401,
-            content_type="application/json",
-            body=json.dumps({"ok": False, "error": "bootstrap authentication required"}),
-        )
-
-    context.route("**/api/**", api)
+def test_startup_rejects_unauthorized_tailscale_identity_and_stops(browser, tmp_path, monkeypatch):
+    """A non-allowlisted Tailscale identity gets the real 401 response and the
+    page makes no subsequent protected API calls."""
+    origin, backend, context, calls, _protected_cookies = _tailscale_dashboard_context(
+        browser, tmp_path, monkeypatch, "other@example.com"
+    )
     page = context.new_page()
-    page.goto(dashboard_url, wait_until="networkidle")
+    page.goto(origin, wait_until="networkidle")
     content = page.locator("#content").inner_text()
     page.close()
     context.close()
+    backend.close()
 
-    assert calls == ["session"]
+    assert calls == ["/api/session"]
     assert "Dashboard access was not authorized" in content
 
 
