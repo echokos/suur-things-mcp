@@ -9,7 +9,7 @@ User=grace
 Group=grace
 EnvironmentFile=/etc/suur-grace-ingress.env
 Environment=HOME=/home/grace HERMES_HOME=/home/grace/.hermes/profiles/grace
-ExecStart=/usr/bin/python3 /opt/suur-things-mcp/scripts/grace_hermes_ingress.py --host 127.0.0.1 --port ${GRACE_INGRESS_PORT} --shared-key-file ${GRACE_SHARED_KEY_FILE} --spool-dir /var/lib/suur-grace-ingress/proposals --hermes-home /home/grace/.hermes/profiles/grace --hermes-bin /usr/local/bin/hermes --timeout-seconds 30
+ExecStart=/usr/bin/python3 /opt/suur-things-mcp/scripts/grace_hermes_ingress.py --host 127.0.0.1 --port ${GRACE_INGRESS_PORT} --shared-key-file ${GRACE_SHARED_KEY_FILE} --spool-dir /var/lib/suur-grace-ingress/proposals --hermes-home /home/grace/.hermes/profiles/grace --hermes-bin ${GRACE_HERMES_BIN} --hermes-install-root ${GRACE_HERMES_INSTALL_ROOT} --timeout-seconds 30
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

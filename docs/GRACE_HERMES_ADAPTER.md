@@ -34,8 +34,9 @@ overrides it before installation.
 Grace's Hermes runtime receives proposals through the checked-in
 `scripts/grace_hermes_ingress.py` service. It binds **only** to `127.0.0.1`,
 verifies the SUUR `timestamp.body` HMAC envelope with the transferred 0600 key,
-uses the real configured `grace` profile via the fixed absolute Hermes binary
-with `hermes chat --toolsets context_engine --quiet --max-turns 1 --source
+uses the real configured `grace` profile via a fixed absolute Hermes binary
+inside an explicit trusted `GRACE_HERMES_INSTALL_ROOT`, with `hermes chat
+--toolsets context_engine --quiet --max-turns 1 --source
 suur-grace-ingress`, and
 returns an HMAC-authenticated non-mutating chat response. Duplicate proposals
 reuse their persisted response; concurrent retries return `processing`. Proposal
@@ -43,19 +44,29 @@ content is data, not instructions, and the adapter cannot approve, deny, or
 modify Things.
 
 `context_engine` is deliberately pinned as a **zero-tool** toolset. Before the
-ingress binds a port or executes a proposal, it invokes the configured absolute
-Hermes binary under the configured Grace `HERMES_HOME`, locates that exact
-installation's resolver runtime, and verifies that both the named toolset and
-the final registered schema resolve to no tools. It fails closed if the CLI,
-toolset, resolver evidence, or zero-tool result is unavailable or malformed.
+ingress binds a port, it captures descriptor-bound identities for the configured
+install root, launcher directory/binary, `venv/bin` runtime Python, resolver
+modules, Grace profile, and config. Every component must have an absolute,
+stable path with secure owner/mode; the install root and launcher/runtime source
+must not be group- or world-writable. The resolver runs through the captured
+runtime descriptor and verifies that both the named toolset and final registered
+schema resolve to no tools. Each delivery revalidates those identities and
+executes the retained launcher descriptor (`/proc/self/fd` on Linux, `/dev/fd`
+on macOS), so a path replacement between validation and exec cannot redirect
+the chat process. Changed, retargeted, malformed, missing, or nonzero components
+fail closed. `hermes --version` output is never an authority for the install
+root or runtime pairing.
 There is no fallback to default tools, `safe`, prompt-only restrictions, or
 `--safe-mode`; an invocation can only use the fixed `context_engine` value.
 
 On the Linux Grace host, install `deploy/grace-hermes-ingress.service` and
 `deploy/grace-hermes-ingress.env.example` as `/etc/systemd/system/` and
-`/etc/suur-grace-ingress.env` (mode 0600). The unit uses the actual Grace profile
-home and starts the bounded `hermes chat` invocation; it is not a generic Hermes
-webhook. Run the ingress behind Tailscale Serve (not Funnel or a public proxy):
+`/etc/suur-grace-ingress.env` (mode 0600). Set `GRACE_HERMES_INSTALL_ROOT` to
+the secured canonical Hermes installation and `GRACE_HERMES_BIN` to its launcher
+inside that root; do not point the unit at a generic PATH shim. The unit uses the
+actual Grace profile home and starts the bounded `hermes chat` invocation; it is
+not a generic Hermes webhook. Run the ingress behind Tailscale Serve (not Funnel
+or a public proxy):
 
 ```sh
 sudo systemctl daemon-reload

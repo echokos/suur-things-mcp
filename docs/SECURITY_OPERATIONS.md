@@ -58,12 +58,18 @@ through the authenticated, idempotency-guarded, stable-ID-readback update path.
 The service never shells out to a general agent runner.
 
 The private Grace ingress is a separate capability boundary: it runs only the
-configured absolute Hermes CLI with `chat --toolsets context_engine`. At service
-startup it verifies, through that exact installation and the actual Grace
-`HERMES_HOME`, that `context_engine` exists and produces both an empty resolved
-tool list and an empty final schema. A missing, malformed, or nonzero result
-keeps the ingress from binding; it must never fall back to default tools,
-`safe`, `--safe-mode`, or prompt-only restrictions.
+configured absolute Hermes CLI with `chat --toolsets context_engine`. Its service
+unit sets an explicit `GRACE_HERMES_INSTALL_ROOT` and a launcher path contained
+by that root. Before binding, the ingress captures and verifies secure identities
+for the launcher directory/binary, `venv/bin` Python, resolver modules, Grace
+profile, and config; group- or world-writable components are rejected. It runs
+the resolver and each chat process through inherited executable descriptors,
+revalidating every identity before delivery. Thus a symlink retarget or path
+replacement after startup fails closed, while a replacement immediately after
+the check cannot redirect execution. CLI `--version` output is not trusted for
+install-root discovery. A missing, malformed, changed, or nonzero resolver
+result keeps the ingress from binding or delivering; it must never fall back to
+default tools, `safe`, `--safe-mode`, or prompt-only restrictions.
 
 `GET /api/healthz` is liveness-only. `GET /api/readyz` returns 503 if Things data cannot be read and never includes paths, task data, tokens, or diagnostics.
 

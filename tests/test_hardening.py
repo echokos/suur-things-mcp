@@ -101,47 +101,27 @@ def test_private_grace_ingress_has_a_fixed_local_runtime_contract():
     assert result.returncode == 0
     assert "--shared-key-file" in result.stdout
     assert "--spool-dir" in result.stdout
+    assert "--hermes-install-root" in result.stdout
     assert "127.0.0.1" in result.stdout
 
 
 def test_grace_ingress_preflight_rejects_nonzero_installed_resolver(tmp_path, monkeypatch):
     """The startup guard accepts only zero tools from the configured install."""
-    ingress = _grace_ingress_module()
-    hermes_bin = tmp_path / "bin" / "hermes"
-    hermes_bin.parent.mkdir()
-    hermes_bin.write_text("#!/bin/sh\n", encoding="utf-8")
-    hermes_bin.chmod(0o700)
-    install_root = tmp_path / "installed-hermes"
-    (install_root / "venv" / "bin").mkdir(parents=True)
-    (install_root / "toolsets.py").write_text("# installed resolver marker\n", encoding="utf-8")
-    (install_root / "venv" / "bin" / "python3").write_text("#!/bin/sh\n", encoding="utf-8")
-    hermes_home = tmp_path / "grace"
-    hermes_home.mkdir()
-    (hermes_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    ingress, install_root, hermes_bin, hermes_home = _trusted_grace_runtime(tmp_path)
 
     def fake_run(argv, **_kwargs):
-        stdout = (
-            f"Install directory: {install_root}\n"
-            if argv[-1] == "--version"
-            else '{"tool_definition_names":["terminal"],"resolved_tool_names":["terminal"],"toolset":"context_engine","valid":true}\n'
+        return subprocess.CompletedProcess(
+            argv, 0,
+            stdout='{"tool_definition_names":["terminal"],"resolved_tool_names":["terminal"],"toolset":"context_engine","valid":true}\n',
         )
-        return subprocess.CompletedProcess(argv, 0, stdout=stdout)
 
     monkeypatch.setattr(ingress.subprocess, "run", fake_run)
     with pytest.raises(ValueError, match="zero tools"):
-        ingress.verify_zero_toolset(hermes_bin, hermes_home, timeout_seconds=3)
+        ingress.verify_zero_toolset(hermes_bin, hermes_home, install_root, timeout_seconds=3)
 
 
 def test_grace_ingress_chat_argv_cannot_enable_any_non_context_engine_toolset(tmp_path, monkeypatch):
-    script = os.path.join(os.path.dirname(__file__), "..", "scripts", "grace_hermes_ingress.py")
-    spec = importlib.util.spec_from_file_location("grace_ingress_argv", script)
-    assert spec and spec.loader
-    ingress = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(ingress)
-
-    hermes_bin = tmp_path / "hermes"
-    hermes_bin.write_text("#!/bin/sh\nprintf '%s\\n' 'Grace received the proposal.'\n", encoding="utf-8")
-    hermes_bin.chmod(0o700)
+    ingress, install_root, hermes_bin, hermes_home = _trusted_grace_runtime(tmp_path)
     invoked = []
     original_run = ingress.subprocess.run
 
@@ -149,16 +129,18 @@ def test_grace_ingress_chat_argv_cannot_enable_any_non_context_engine_toolset(tm
         invoked.append(argv)
         return original_run(argv, **kwargs)
 
+    runtime = ingress.HermesRuntime(
+        str(hermes_bin), hermes_home, tmp_path / "spool", 3, hermes_install_root=install_root,
+    )
+    runtime.verify_zero_toolset()
     monkeypatch.setattr(ingress.subprocess, "run", capture_run)
-    runtime = ingress.HermesRuntime(str(hermes_bin), tmp_path / "grace", tmp_path / "spool", 3)
-    runtime._zero_toolset_preflight_complete = True
     response = runtime.deliver(
         b'{"profile":"grace","proposal_id":"proposal-argv","task_data":{"title":"--toolsets terminal"}}',
         "proposal-argv",
     )
 
     assert response["ok"] is True
-    assert invoked[0][:5] == [str(hermes_bin), "chat", "--toolsets", "context_engine", "--query"]
+    assert invoked[0][1:5] == ["chat", "--toolsets", "context_engine", "--query"]
     assert invoked[0][6:] == ["--quiet", "--max-turns", "1", "--source", "suur-grace-ingress"]
 
 
@@ -225,21 +207,16 @@ def test_grace_decision_cli_delivers_to_configured_tailscale_https_port(tmp_path
 
 
 def test_private_grace_ingress_verifies_and_spools_a_signed_proposal(tmp_path):
-    script = os.path.join(os.path.dirname(__file__), "..", "scripts", "grace_hermes_ingress.py")
-    spec = importlib.util.spec_from_file_location("grace_ingress", script)
-    assert spec and spec.loader
-    ingress = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(ingress)
+    ingress, install_root, fake_hermes, hermes_home = _trusted_grace_runtime(tmp_path)
 
     key_file = tmp_path / "grace-shared-key"
     key_file.write_text("grace-shared-secret\n", encoding="utf-8")
     key_file.chmod(0o600)
     spool_dir = tmp_path / "spool"
-    fake_hermes = tmp_path / "hermes"
-    fake_hermes.write_text("#!/bin/sh\nprintf '%s\\n' 'Grace received the proposal.'\n", encoding="utf-8")
-    fake_hermes.chmod(0o700)
-    runtime = ingress.HermesRuntime(str(fake_hermes), tmp_path / "grace", spool_dir, 3)
-    runtime._zero_toolset_preflight_complete = True
+    runtime = ingress.HermesRuntime(
+        str(fake_hermes), hermes_home, spool_dir, 3, hermes_install_root=install_root,
+    )
+    runtime.verify_zero_toolset()
     server = ingress.ThreadingHTTPServer(("127.0.0.1", 0), ingress._handler(ingress._secret(key_file), runtime))
     thread = threading.Thread(target=server.handle_request)
     thread.start()
@@ -284,13 +261,71 @@ def _grace_ingress_module():
     return ingress
 
 
-def test_grace_ingress_pins_zero_toolset_in_exact_argv_after_failure_and_retry(tmp_path, monkeypatch):
-    """A transient Hermes failure must never make a retry fall back to default tools."""
+def _trusted_grace_runtime(tmp_path):
+    """Build a small, real paired launcher/runtime installation for ingress tests."""
     ingress = _grace_ingress_module()
+    install_root = tmp_path / "installed-hermes"
+    launcher = install_root / "bin" / "hermes"
+    runtime_python = install_root / "venv" / "bin" / "python3"
+    runtime_python.parent.mkdir(parents=True)
+    launcher.parent.mkdir()
+    runtime_python.write_text(f"#!/bin/sh\nexec {sys.executable} \"$@\"\n", encoding="utf-8")
+    runtime_python.chmod(0o700)
+    launcher.write_text("#!/bin/sh\nprintf '%s\\n' 'Grace received the proposal.'\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    resolver_source = install_root / "resolver"
+    resolver_source.mkdir()
+    (resolver_source / "toolsets-v1.py").write_text(
+        "def validate_toolset(name):\n    return name == 'context_engine'\n\n"
+        "def resolve_toolset(name):\n    return []\n",
+        encoding="utf-8",
+    )
+    (install_root / "toolsets.py").symlink_to("resolver/toolsets-v1.py")
+    (install_root / "model_tools.py").write_text(
+        "def get_tool_definitions(*, enabled_toolsets, quiet_mode):\n    return []\n",
+        encoding="utf-8",
+    )
     hermes_home = tmp_path / "grace"
     hermes_home.mkdir()
-    runtime = ingress.HermesRuntime("/fixed/hermes", hermes_home, tmp_path / "spool", 3)
-    runtime._zero_toolset_preflight_complete = True
+    (hermes_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    return ingress, install_root, launcher, hermes_home
+
+
+def test_grace_ingress_chat_executes_validated_launcher_fd_when_path_is_replaced(tmp_path, monkeypatch):
+    """Replacing the launcher after revalidation cannot redirect the chat exec."""
+    ingress, install_root, launcher, hermes_home = _trusted_grace_runtime(tmp_path)
+    runtime = ingress.HermesRuntime(
+        str(launcher), hermes_home, tmp_path / "spool", 3, hermes_install_root=install_root,
+    )
+    runtime.verify_zero_toolset()
+    marker = tmp_path / "malicious-launcher-ran"
+    replacement = tmp_path / "replacement-hermes"
+    replacement.write_text(f"#!/bin/sh\n: > {marker}\nprintf '%s\\n' malicious\n", encoding="utf-8")
+    replacement.chmod(0o700)
+    original_run = ingress.subprocess.run
+
+    def replace_between_check_and_exec(argv, **kwargs):
+        if len(argv) > 1 and argv[1] == "chat":
+            os.replace(replacement, launcher)
+        return original_run(argv, **kwargs)
+
+    monkeypatch.setattr(ingress.subprocess, "run", replace_between_check_and_exec)
+    response = runtime.deliver(
+        b'{"profile":"grace","proposal_id":"fd-bound","task_data":{"title":"data"}}', "fd-bound",
+    )
+
+    assert response["ok"] is True
+    assert response["chat_response"] == "Grace received the proposal."
+    assert not marker.exists()
+
+
+def test_grace_ingress_pins_zero_toolset_in_exact_argv_after_failure_and_retry(tmp_path, monkeypatch):
+    """A transient Hermes failure must never make a retry fall back to default tools."""
+    ingress, install_root, hermes_bin, hermes_home = _trusted_grace_runtime(tmp_path)
+    runtime = ingress.HermesRuntime(
+        str(hermes_bin), hermes_home, tmp_path / "spool", 3, hermes_install_root=install_root,
+    )
+    runtime.verify_zero_toolset()
     body = json.dumps(
         {"profile": "grace", "proposal_id": "proposal-argv", "task_data": {"id": "todo-1", "title": "data"}},
         separators=(",", ":"),
@@ -316,16 +351,18 @@ def test_grace_ingress_pins_zero_toolset_in_exact_argv_after_failure_and_retry(t
         + body.decode("utf-8")
     )
     expected = [
-        "/fixed/hermes", "chat", "--toolsets", "context_engine", "--query", prompt,
+        "chat", "--toolsets", "context_engine", "--query", prompt,
         "--quiet", "--max-turns", "1", "--source", "suur-grace-ingress",
     ]
-    assert [argv for argv, _kwargs in calls] == [expected, expected]
+    assert [argv[1:] for argv, _kwargs in calls] == [expected, expected]
     assert all(kwargs["env"]["HERMES_HOME"] == str(hermes_home) for _argv, kwargs in calls)
 
 
 def test_grace_ingress_fails_closed_without_successful_zero_toolset_preflight(tmp_path, monkeypatch):
     ingress = _grace_ingress_module()
-    runtime = ingress.HermesRuntime("/fixed/hermes", tmp_path / "grace", tmp_path / "spool", 3)
+    runtime = ingress.HermesRuntime(
+        "/fixed/hermes", tmp_path / "grace", tmp_path / "spool", 3, hermes_install_root=tmp_path,
+    )
     body = b'{"profile":"grace","proposal_id":"proposal-preflight","task_data":{}}'
 
     monkeypatch.setattr(ingress.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("must not invoke Hermes"))
@@ -337,36 +374,25 @@ def test_grace_ingress_fails_closed_without_successful_zero_toolset_preflight(tm
 
 
 def test_zero_toolset_preflight_rejects_malformed_installed_resolver_evidence(tmp_path, monkeypatch):
-    ingress = _grace_ingress_module()
-    hermes_bin = tmp_path / "bin" / "hermes"
-    hermes_bin.parent.mkdir()
-    hermes_bin.write_text("#!/bin/sh\n", encoding="utf-8")
-    hermes_bin.chmod(0o700)
-    install_root = tmp_path / "installed-hermes"
-    (install_root / "venv" / "bin").mkdir(parents=True)
-    (install_root / "toolsets.py").write_text("# installed resolver marker\n", encoding="utf-8")
-    (install_root / "venv" / "bin" / "python3").write_text("#!/bin/sh\n", encoding="utf-8")
+    ingress, install_root, hermes_bin, hermes_home = _trusted_grace_runtime(tmp_path)
     calls = []
 
     def fake_run(argv, **kwargs):
         calls.append((argv, kwargs))
-        stdout = f"Install directory: {install_root}\n" if len(calls) == 1 else "not-json\n"
-        return subprocess.CompletedProcess(argv, 0, stdout=stdout)
+        return subprocess.CompletedProcess(argv, 0, stdout="not-json\n")
 
     monkeypatch.setattr(ingress.subprocess, "run", fake_run)
-    hermes_home = tmp_path / "grace"
-    hermes_home.mkdir()
-    (hermes_home / "config.yaml").write_text("{}\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="malformed toolset evidence"):
-        ingress.verify_zero_toolset(hermes_bin, hermes_home, timeout_seconds=3)
+        ingress.verify_zero_toolset(hermes_bin, hermes_home, install_root, timeout_seconds=3)
 
-    assert calls[0][0] == [str(hermes_bin), "--version"]
+    assert calls[0][0][0].startswith("/proc/self/fd/")
+    assert calls[0][0][1:3] == ["-I", "-c"]
     assert calls[0][1]["env"]["HERMES_HOME"] == str(hermes_home)
 
 
-def test_installed_hermes_context_engine_resolves_to_no_capabilities(tmp_path):
-    """Readiness depends on the installed Hermes resolver, not our local assumptions."""
+def test_installed_hermes_context_engine_rejects_a_group_writable_install_root(tmp_path):
+    """A resolver result cannot make an insecure configured install acceptable."""
     ingress = _grace_ingress_module()
     hermes_bin = which("hermes")
     assert hermes_bin, "an installed Hermes CLI is required to verify the ingress capability boundary"
@@ -375,6 +401,7 @@ def test_installed_hermes_context_engine_resolves_to_no_capabilities(tmp_path):
     (hermes_home / "config.yaml").write_text("{}\n", encoding="utf-8")
 
     configured_bin = Path(hermes_bin).resolve()
+    install_root = configured_bin.parents[2]
     cli_contract = subprocess.run(
         [str(configured_bin), "chat", "--toolsets", "context_engine", "--help"],
         check=True,
@@ -383,15 +410,73 @@ def test_installed_hermes_context_engine_resolves_to_no_capabilities(tmp_path):
         timeout=30,
         env={**os.environ, "HERMES_HOME": str(hermes_home)},
     )
-    resolved = ingress.verify_zero_toolset(configured_bin, hermes_home, timeout_seconds=30)
+    with pytest.raises(ValueError, match="group- or world-writable"):
+        ingress.verify_zero_toolset(configured_bin, hermes_home, install_root, timeout_seconds=30)
 
     assert "--toolsets TOOLSETS" in cli_contract.stdout
-    assert resolved == []
-    forbidden = {
-        "terminal", "process", "read_file", "write_file", "patch", "search_files", "web_search", "web_extract",
-        "browser_exec", "computer_use", "cronjob", "kanban_show", "mcp", "things", "send_message",
+
+
+def test_grace_ingress_rejects_untrusted_launcher_path_even_with_spoofed_cli_output(tmp_path, monkeypatch):
+    """`--version` text cannot smuggle a launcher from outside the trusted root."""
+    ingress, install_root, _launcher, hermes_home = _trusted_grace_runtime(tmp_path)
+    untrusted_launcher = tmp_path / "outside-hermes"
+    untrusted_launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    untrusted_launcher.chmod(0o700)
+    monkeypatch.setattr(
+        ingress.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, stdout=f"Install directory: {install_root}\n"),
+    )
+
+    with pytest.raises(ValueError, match="inside the configured Hermes install root"):
+        ingress.verify_zero_toolset(untrusted_launcher, hermes_home, install_root, timeout_seconds=3)
+
+
+def test_grace_ingress_fails_closed_when_resolver_source_changes_after_preflight(tmp_path, monkeypatch):
+    """A runtime-source modification invalidates the retained descriptor bundle."""
+    ingress, install_root, launcher, hermes_home = _trusted_grace_runtime(tmp_path)
+    runtime = ingress.HermesRuntime(
+        str(launcher), hermes_home, tmp_path / "spool", 3, hermes_install_root=install_root,
+    )
+    runtime.verify_zero_toolset()
+    (install_root / "toolsets.py").write_text("raise RuntimeError('replacement')\n", encoding="utf-8")
+    monkeypatch.setattr(ingress.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("must not execute Hermes"))
+
+    assert runtime.deliver(b'{"profile":"grace","proposal_id":"changed-source","task_data":{}}', "changed-source") == {
+        "ok": False, "proposal_id": "changed-source", "status": "grace_unavailable",
     }
-    assert forbidden.isdisjoint(resolved)
+
+
+def test_grace_ingress_fails_closed_when_resolver_symlink_is_retargeted(tmp_path, monkeypatch):
+    """A retargeted source symlink cannot reuse the previously verified resolver."""
+    ingress, install_root, launcher, hermes_home = _trusted_grace_runtime(tmp_path)
+    runtime = ingress.HermesRuntime(
+        str(launcher), hermes_home, tmp_path / "spool", 3, hermes_install_root=install_root,
+    )
+    runtime.verify_zero_toolset()
+    (install_root / "resolver" / "toolsets-v2.py").write_text(
+        "def validate_toolset(name):\n    return True\n\ndef resolve_toolset(name):\n    return ['terminal']\n",
+        encoding="utf-8",
+    )
+    source_link = install_root / "toolsets.py"
+    source_link.unlink()
+    source_link.symlink_to("resolver/toolsets-v2.py")
+    monkeypatch.setattr(ingress.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("must not execute Hermes"))
+
+    assert runtime.deliver(b'{"profile":"grace","proposal_id":"retargeted","task_data":{}}', "retargeted")["status"] == "grace_unavailable"
+
+
+def test_grace_ingress_fails_closed_when_venv_bin_permissions_change(tmp_path, monkeypatch):
+    """Permission changes to paired runtime directories invalidate the bundle."""
+    ingress, install_root, launcher, hermes_home = _trusted_grace_runtime(tmp_path)
+    runtime = ingress.HermesRuntime(
+        str(launcher), hermes_home, tmp_path / "spool", 3, hermes_install_root=install_root,
+    )
+    runtime.verify_zero_toolset()
+    (install_root / "venv" / "bin").chmod(0o775)
+    monkeypatch.setattr(ingress.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("must not execute Hermes"))
+
+    assert runtime.deliver(b'{"profile":"grace","proposal_id":"venv-mode","task_data":{}}', "venv-mode")["status"] == "grace_unavailable"
 
 
 @pytest.mark.parametrize("uri", ["file:/tmp/thing.sqlite?mode=ro&immutable=1", "file:/tmp/space%20db?mode=ro&immutable=1"])
