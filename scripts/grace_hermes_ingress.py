@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import os
+import shlex
 import stat
 import subprocess
 import time
@@ -26,6 +27,13 @@ _PATH = "/api/suur/grace/proposals"
 _HEALTH_PATH = "/healthz"
 _MAX_BODY_BYTES = 64 * 1024
 _MAX_AGE_SECONDS = 300
+_CONTEXT_ENGINE_TOOLSET = "context_engine"
+_CONTEXT_ENGINE_PROBE = (
+    "import json\n"
+    "from toolsets import resolve_toolset, validate_toolset\n"
+    "name = 'context_engine'\n"
+    "print(json.dumps({'valid': validate_toolset(name), 'tools': resolve_toolset(name)}, sort_keys=True))\n"
+)
 
 
 def _secret(path: Path) -> str:
@@ -78,6 +86,45 @@ class HermesRuntime:
         self.spool_dir = spool_dir
         self.timeout_seconds = timeout_seconds
 
+    def verify_ready(self) -> None:
+        """Fail startup unless this exact Hermes install resolves no callable tools."""
+        binary = Path(self.hermes_bin)
+        if not binary.is_absolute() or not binary.is_file() or not os.access(binary, os.X_OK):
+            raise ValueError("--hermes-bin must be an absolute executable Hermes CLI")
+        try:
+            first_line = binary.read_text(encoding="utf-8").splitlines()[0]
+        except (OSError, IndexError) as exc:
+            raise ValueError("--hermes-bin must be a readable Python Hermes launcher") from exc
+        if not first_line.startswith("#!"):
+            raise ValueError("--hermes-bin must be a Python Hermes launcher")
+        interpreter = shlex.split(first_line[2:])
+        if not interpreter or not Path(interpreter[0]).is_absolute():
+            raise ValueError("--hermes-bin launcher must use an absolute Python interpreter")
+
+        runtime_env = {"HERMES_HOME": str(self.hermes_home), "HOME": str(self.hermes_home.parent)}
+        try:
+            subprocess.run(
+                [str(binary), "--version"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=min(self.timeout_seconds, 5),
+                env=runtime_env,
+            )
+            checked = subprocess.run(
+                [*interpreter, "-c", _CONTEXT_ENGINE_PROBE],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=min(self.timeout_seconds, 5),
+                env=runtime_env,
+            )
+            result = json.loads(checked.stdout)
+        except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            raise ValueError("configured Hermes context_engine readiness check failed") from exc
+        if result != {"tools": [], "valid": True}:
+            raise ValueError("configured Hermes context_engine must be valid and resolve to exactly zero tools")
+
     def deliver(self, body: bytes, proposal_id: str) -> dict[str, object]:
         destination = _spool_path(proposal_id, self.spool_dir)
         if destination.exists():
@@ -97,7 +144,19 @@ class HermesRuntime:
                 + body.decode("utf-8")
             )
             completed = subprocess.run(
-                [self.hermes_bin, "chat", "--query", prompt, "--quiet", "--max-turns", "1", "--source", "suur-grace-ingress"],
+                [
+                    self.hermes_bin,
+                    "--toolsets",
+                    _CONTEXT_ENGINE_TOOLSET,
+                    "chat",
+                    "--query",
+                    prompt,
+                    "--quiet",
+                    "--max-turns",
+                    "1",
+                    "--source",
+                    "suur-grace-ingress",
+                ],
                 check=True, capture_output=True, text=True, timeout=self.timeout_seconds,
                 env={**os.environ, "HERMES_HOME": str(self.hermes_home)},
             )
@@ -186,7 +245,7 @@ def main() -> int:
     parser.add_argument("--shared-key-file", required=True, help="regular 0600 Grace shared-key file")
     parser.add_argument("--spool-dir", required=True, help="private 0700 idempotency record spool")
     parser.add_argument("--hermes-home", required=True, help="absolute Hermes home for the configured grace profile")
-    parser.add_argument("--hermes-bin", default="hermes", help="fixed Hermes CLI executable")
+    parser.add_argument("--hermes-bin", required=True, help="absolute Hermes CLI executable")
     parser.add_argument("--timeout-seconds", type=int, default=30, help="bounded Grace chat invocation timeout")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
@@ -199,6 +258,7 @@ def main() -> int:
         if not 1 <= args.timeout_seconds <= 60:
             raise ValueError("--timeout-seconds must be from 1 through 60")
         runtime = HermesRuntime(args.hermes_bin, hermes_home, Path(args.spool_dir), args.timeout_seconds)
+        runtime.verify_ready()
         handler = _handler(key, runtime)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))

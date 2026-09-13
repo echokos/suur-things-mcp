@@ -34,17 +34,24 @@ overrides it before installation.
 Grace's Hermes runtime receives proposals through the checked-in
 `scripts/grace_hermes_ingress.py` service. It binds **only** to `127.0.0.1`,
 verifies the SUUR `timestamp.body` HMAC envelope with the transferred 0600 key,
-uses the real configured `grace` profile via `hermes chat --max-turns 1`, and
-returns an HMAC-authenticated non-mutating chat response. Duplicate proposals
-reuse their persisted response; concurrent retries return `processing`. Proposal
-content is data, not instructions, and the adapter cannot approve, deny, or
-modify Things.
+uses the real configured `grace` profile via `hermes --toolsets context_engine
+chat --max-turns 1`, and returns an HMAC-authenticated non-mutating chat
+response. Startup requires an absolute Hermes launcher and rejects the service
+unless that installed launcher's `context_engine` toolset is valid and resolves
+to exactly zero callable tools. Duplicate proposals reuse their persisted
+response; concurrent retries return `processing`. Proposal content is data, not
+instructions, and the adapter cannot approve, deny, or modify Things.
+
+After every Hermes upgrade, restart the ingress so this readiness check runs
+against the new installed launcher. A failed check is a hard stop: do not
+replace it with a default toolset, `safe`, or a prompt-only restriction.
 
 On the Linux Grace host, install `deploy/grace-hermes-ingress.service` and
 `deploy/grace-hermes-ingress.env.example` as `/etc/systemd/system/` and
 `/etc/suur-grace-ingress.env` (mode 0600). The unit uses the actual Grace profile
-home and starts the bounded `hermes chat` invocation; it is not a generic Hermes
-webhook. Run the ingress behind Tailscale Serve (not Funnel or a public proxy):
+home and starts the bounded zero-tool `hermes` invocation; it is not a generic
+Hermes webhook. Run the ingress behind Tailscale Serve (not Funnel or a public
+proxy):
 
 ```sh
 sudo systemctl daemon-reload

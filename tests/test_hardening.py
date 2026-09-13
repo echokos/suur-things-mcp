@@ -102,6 +102,72 @@ def test_private_grace_ingress_has_a_fixed_local_runtime_contract():
     assert "127.0.0.1" in result.stdout
 
 
+def test_grace_ingress_runtime_uses_its_installed_zero_tool_resolver(tmp_path, monkeypatch):
+    """Ingress startup must execute the configured launcher's resolver, not a local default."""
+    script = os.path.join(os.path.dirname(__file__), "..", "scripts", "grace_hermes_ingress.py")
+    spec = importlib.util.spec_from_file_location("grace_ingress_runtime", script)
+    assert spec and spec.loader
+    ingress = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ingress)
+
+    hermes_home = tmp_path / "grace"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    hermes_bin = tmp_path / "hermes"
+    hermes_bin.write_text(f"#!{sys.executable}\n", encoding="utf-8")
+    hermes_bin.chmod(0o700)
+    zero_tool_install = tmp_path / "zero-tool-install"
+    zero_tool_install.mkdir()
+    (zero_tool_install / "toolsets.py").write_text(
+        "def validate_toolset(name):\n    return name == 'context_engine'\n\n"
+        "def resolve_toolset(name):\n    return []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(zero_tool_install)
+    runtime = ingress.HermesRuntime(str(hermes_bin), hermes_home, tmp_path / "spool", 3)
+
+    runtime.verify_ready()
+    nonzero_tool_install = tmp_path / "nonzero-tool-install"
+    nonzero_tool_install.mkdir()
+    (nonzero_tool_install / "toolsets.py").write_text(
+        "def validate_toolset(name):\n    return name == 'context_engine'\n\n"
+        "def resolve_toolset(name):\n    return ['terminal', 'read_file', 'web_search', 'browser', 'kanban_complete']\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(nonzero_tool_install)
+    with pytest.raises(ValueError, match="zero tools"):
+        runtime.verify_ready()
+
+
+def test_grace_ingress_chat_argv_cannot_enable_any_non_context_engine_toolset(tmp_path, monkeypatch):
+    script = os.path.join(os.path.dirname(__file__), "..", "scripts", "grace_hermes_ingress.py")
+    spec = importlib.util.spec_from_file_location("grace_ingress_argv", script)
+    assert spec and spec.loader
+    ingress = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ingress)
+
+    hermes_bin = tmp_path / "hermes"
+    hermes_bin.write_text("#!/bin/sh\nprintf '%s\\n' 'Grace received the proposal.'\n", encoding="utf-8")
+    hermes_bin.chmod(0o700)
+    invoked = []
+    original_run = ingress.subprocess.run
+
+    def capture_run(argv, **kwargs):
+        invoked.append(argv)
+        return original_run(argv, **kwargs)
+
+    monkeypatch.setattr(ingress.subprocess, "run", capture_run)
+    runtime = ingress.HermesRuntime(str(hermes_bin), tmp_path / "grace", tmp_path / "spool", 3)
+    response = runtime.deliver(
+        b'{"profile":"grace","proposal_id":"proposal-argv","task_data":{"title":"--toolsets terminal"}}',
+        "proposal-argv",
+    )
+
+    assert response["ok"] is True
+    assert invoked[0][:5] == [str(hermes_bin), "--toolsets", "context_engine", "chat", "--query"]
+    assert invoked[0][6:] == ["--quiet", "--max-turns", "1", "--source", "suur-grace-ingress"]
+
+
 def test_grace_decision_callback_uses_configured_tailscale_https_port(monkeypatch):
     """The decision adapter may target only the private :8443 Serve listener."""
     script = os.path.join(os.path.dirname(__file__), "..", "scripts", "grace_hermes_decide.py")
