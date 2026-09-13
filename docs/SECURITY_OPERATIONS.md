@@ -57,6 +57,14 @@ must approve the same proposal before the service applies its whitelisted change
 through the authenticated, idempotency-guarded, stable-ID-readback update path.
 The service never shells out to a general agent runner.
 
+The private Grace ingress is a separate capability boundary: it runs only the
+configured absolute Hermes CLI with `chat --toolsets context_engine`. At service
+startup it verifies, through that exact installation and the actual Grace
+`HERMES_HOME`, that `context_engine` exists and produces both an empty resolved
+tool list and an empty final schema. A missing, malformed, or nonzero result
+keeps the ingress from binding; it must never fall back to default tools,
+`safe`, `--safe-mode`, or prompt-only restrictions.
+
 `GET /api/healthz` is liveness-only. `GET /api/readyz` returns 503 if Things data cannot be read and never includes paths, task data, tokens, or diagnostics.
 
 ## MCP principals
@@ -98,4 +106,4 @@ uv run pytest
 uv run ruff check .
 ```
 
-Before upgrade, back up the Things database through Things/macOS tooling and the SUUR configuration/security databases. Test the upgraded service against a copy of Things data. On Things failure, leave writes disabled, inspect `/api/readyz`, and restore service only after a read-only health check passes. To roll back, `launchctl bootout gui/$(id -u)/io.suur.things-dashboard`, restore the prior fixed checkout/venv symlink and security database backup, then rerun the private installer. To remove it, run `suur-things-mcp dashboard --uninstall-service` and `tailscale serve reset`; preserve or securely destroy the local secret directory according to whether a later reinstall must retain existing sessions. There is no production deployment step in this repository.
+Before upgrade, back up the Things database through Things/macOS tooling and the SUUR configuration/security databases. Test the upgraded service against a copy of Things data. For a Hermes upgrade on the Grace host, also rerun `uv run pytest tests/test_hardening.py -k context_engine`; the ingress startup preflight must revalidate the exact configured binary as zero tools before it becomes ready. On Things failure, leave writes disabled, inspect `/api/readyz`, and restore service only after a read-only health check passes. To roll back, `launchctl bootout gui/$(id -u)/io.suur.things-dashboard`, restore the prior fixed checkout/venv symlink and security database backup, then rerun the private installer. To remove it, run `suur-things-mcp dashboard --uninstall-service` and `tailscale serve reset`; preserve or securely destroy the local secret directory according to whether a later reinstall must retain existing sessions. There is no production deployment step in this repository.
