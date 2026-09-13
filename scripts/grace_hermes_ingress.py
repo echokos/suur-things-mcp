@@ -28,6 +28,18 @@ _HEALTH_PATH = "/healthz"
 _MAX_BODY_BYTES = 64 * 1024
 _MAX_AGE_SECONDS = 300
 _ZERO_TOOLSET = "context_engine"
+_RUNTIME_PROBE = """\
+import encodings
+import json
+import sys
+
+print(json.dumps({
+    "implementation": sys.implementation.name,
+    "prefix": sys.prefix,
+    "executable": sys.executable,
+    "encodings": encodings.__file__,
+}, sort_keys=True))
+"""
 _RESOLVER_PROBE = """\
 import json
 import os
@@ -173,6 +185,10 @@ def _descriptor_digest(descriptor: int) -> str:
     return digest.hexdigest()
 
 
+def _is_shebang_script(descriptor: int) -> bool:
+    return os.pread(descriptor, 2, 0) == b"#!"
+
+
 class _BoundPath:
     """A descriptor plus path identities used to reject path drift before use."""
 
@@ -223,6 +239,8 @@ class _BoundPath:
             target = os.fstat(descriptor)
             if directory != stat.S_ISDIR(target.st_mode):
                 raise ValueError(f"{description} has the wrong filesystem type")
+            if not directory and not stat.S_ISREG(target.st_mode):
+                raise ValueError(f"{description} must be a regular file")
             _safe_owner(target, description)
             canonical = _fd_path(descriptor)
             if allowed_root is not None and not _is_within(canonical, allowed_root):
@@ -342,12 +360,20 @@ class HermesInstallation:
         self.launcher_directory = _BoundPath.capture(
             root / "bin", "Hermes launcher directory", directory=True, allow_symlink=False, allowed_root=root,
         )
-        self.launcher = _BoundPath.capture(hermes_bin, "--hermes-bin", allowed_root=root)
+        self.launcher = _BoundPath.capture(hermes_bin, "--hermes-bin", allowed_root=root, bind_content=True)
         self.venv = _BoundPath.capture(root / "venv", "Hermes venv", directory=True, allowed_root=root)
         self.venv_bin = _BoundPath.capture(
             root / "venv" / "bin", "Hermes venv/bin", directory=True, allowed_root=root,
         )
-        self.runtime_python = _BoundPath.capture(root / "venv" / "bin" / "python3", "Hermes runtime Python")
+        self.runtime_python = _BoundPath.capture(
+            root / "venv" / "bin" / "python3",
+            "Hermes runtime Python",
+            allow_symlink=False,
+            bind_content=True,
+        )
+        if _is_shebang_script(self.runtime_python.descriptor):
+            self.runtime_python.close()
+            raise ValueError("Hermes runtime Python must be a copied CPython binary, not a script wrapper")
         self.module_root = _BoundPath.capture(
             root / "toolsets.py", "Hermes toolset module", allowed_root=root, bind_content=True,
         )
@@ -384,33 +410,44 @@ class HermesInstallation:
             sort_keys=True,
         )
 
-    def run_resolver_probe(self, *, timeout_seconds: int) -> subprocess.CompletedProcess[str]:
-        self.assert_unchanged()
+    def _run_runtime(
+        self,
+        arguments: list[str],
+        *,
+        timeout_seconds: int,
+        extra_pass_fds: tuple[int, ...] = (),
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the retained runtime FD while preserving CPython's validated argv[0]."""
+        runtime_fd_path = _fd_exec_path(self.runtime_python.descriptor)
         return subprocess.run(
-            [_fd_exec_path(self.runtime_python.descriptor), "-I", "-c", _RESOLVER_PROBE],
+            [str(self.runtime_python.canonical_path), *arguments],
+            executable=runtime_fd_path,
             check=True,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
             cwd=self.install_root.canonical_path,
             env=_hermes_environment(self.hermes_home.canonical_path),
-            pass_fds=(self.runtime_python.descriptor,),
+            pass_fds=(self.runtime_python.descriptor, *extra_pass_fds),
         )
+
+    def run_runtime_probe(self, *, timeout_seconds: int) -> subprocess.CompletedProcess[str]:
+        self.assert_unchanged()
+        return self._run_runtime(["-I", "-c", _RUNTIME_PROBE], timeout_seconds=timeout_seconds)
+
+    def run_resolver_probe(self, *, timeout_seconds: int) -> subprocess.CompletedProcess[str]:
+        self.assert_unchanged()
+        return self._run_runtime(["-I", "-c", _RESOLVER_PROBE], timeout_seconds=timeout_seconds)
 
     def run_launcher(self, arguments: list[str], *, timeout_seconds: int) -> subprocess.CompletedProcess[str]:
         self.assert_unchanged()
-        return subprocess.run(
+        return self._run_runtime(
             [
-                _fd_exec_path(self.runtime_python.descriptor), "-I", "-c", _BOUND_LAUNCHER_EXEC,
+                "-I", "-c", _BOUND_LAUNCHER_EXEC,
                 self.execution_records(), _fd_exec_path(self.launcher.descriptor), *arguments,
             ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            cwd=self.install_root.canonical_path,
-            env=_hermes_environment(self.hermes_home.canonical_path),
-            pass_fds=(self.runtime_python.descriptor, self.launcher.descriptor),
+            timeout_seconds=timeout_seconds,
+            extra_pass_fds=(self.launcher.descriptor,),
         )
 
     def close(self) -> None:
@@ -423,6 +460,21 @@ class HermesInstallation:
 
 def _validate_zero_toolset(installation: HermesInstallation, *, timeout_seconds: int) -> list[str]:
     """Prove this descriptor-bound install resolves a strictly empty schema."""
+    runtime_probe = installation.run_runtime_probe(timeout_seconds=timeout_seconds)
+    try:
+        runtime = json.loads(runtime_probe.stdout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("configured Hermes runtime returned malformed descriptor evidence") from exc
+    expected_runtime_keys = {"implementation", "prefix", "executable", "encodings"}
+    if (
+        not isinstance(runtime, dict)
+        or set(runtime) != expected_runtime_keys
+        or runtime["implementation"] != "cpython"
+        or not all(isinstance(runtime[key], str) and runtime[key] for key in expected_runtime_keys - {"implementation"})
+        or Path(runtime["prefix"]).resolve() != installation.venv.canonical_path
+        or Path(runtime["executable"]).resolve() != installation.runtime_python.canonical_path
+    ):
+        raise ValueError("configured Hermes runtime is not a descriptor-bound CPython venv")
     probe = installation.run_resolver_probe(timeout_seconds=timeout_seconds)
     try:
         result = json.loads(probe.stdout)
@@ -478,6 +530,12 @@ class HermesRuntime:
             raise
         self._installation = installation
         self._zero_toolset_preflight_complete = True
+
+    def close(self) -> None:
+        if self._installation is not None:
+            self._installation.close()
+            self._installation = None
+        self._zero_toolset_preflight_complete = False
 
     def deliver(self, body: bytes, proposal_id: str) -> dict[str, object]:
         if not self._zero_toolset_preflight_complete:
@@ -596,6 +654,7 @@ def main() -> int:
     parser.add_argument("--hermes-bin", required=True, help="fixed absolute Hermes CLI executable")
     parser.add_argument("--hermes-install-root", required=True, help="trusted absolute Hermes install root")
     parser.add_argument("--timeout-seconds", type=int, default=30, help="bounded Grace chat invocation timeout")
+    parser.add_argument("--verify-only", action="store_true", help="verify the descriptor-bound runtime, then exit")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be an integer from 1 through 65535")
@@ -614,6 +673,9 @@ def main() -> int:
             hermes_install_root=Path(args.hermes_install_root),
         )
         runtime.verify_zero_toolset()
+        if args.verify_only:
+            runtime.close()
+            return 0
         handler = _handler(key, runtime)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         parser.error(str(exc))
@@ -624,6 +686,7 @@ def main() -> int:
         return 0
     finally:
         server.server_close()
+        runtime.close()
     return 0
 
 

@@ -61,15 +61,20 @@ The private Grace ingress is a separate capability boundary: it runs only the
 configured absolute Hermes CLI with `chat --toolsets context_engine`. Its service
 unit sets an explicit `GRACE_HERMES_INSTALL_ROOT` and a launcher path contained
 by that root. Before binding, the ingress captures and verifies secure identities
-for the launcher directory/binary, `venv/bin` Python, resolver modules, Grace
-profile, and config; group- or world-writable components are rejected. It runs
-the resolver and each chat process through inherited executable descriptors,
-revalidating every identity before delivery. Thus a symlink retarget or path
-replacement after startup fails closed, while a replacement immediately after
-the check cannot redirect execution. CLI `--version` output is not trusted for
-install-root discovery. A missing, malformed, changed, or nonzero resolver
-result keeps the ingress from binding or delivering; it must never fall back to
-default tools, `safe`, `--safe-mode`, or prompt-only restrictions.
+for the launcher directory/binary, a copied regular CPython `venv/bin/python3`
+(never a symlink or shell wrapper), resolver modules, Grace profile, and config;
+group- or world-writable components are rejected. It executes the retained
+runtime descriptor while passing only its validated canonical path as CPython's
+`argv[0]`, preserving the dedicated venv prefix and site-packages without a
+mutable runtime execution path. It proves CPython and an `encodings` import
+before the zero-tool resolver and revalidates every identity before delivery.
+The retained runtime executes retained launcher content directly, never its
+shebang. Thus a symlink retarget or path replacement after startup fails closed,
+while a replacement immediately after the check cannot redirect execution. CLI
+`--version` output is not trusted for install-root discovery. A missing,
+malformed, changed, or nonzero resolver result keeps the ingress from binding or
+delivering; it must never fall back to default tools, `safe`, `--safe-mode`, or
+prompt-only restrictions.
 
 `GET /api/healthz` is liveness-only. `GET /api/readyz` returns 503 if Things data cannot be read and never includes paths, task data, tokens, or diagnostics.
 

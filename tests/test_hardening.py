@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import urllib.request
+import venv
 from pathlib import Path
 from shutil import which
 
@@ -109,7 +110,11 @@ def test_grace_ingress_preflight_rejects_nonzero_installed_resolver(tmp_path, mo
     """The startup guard accepts only zero tools from the configured install."""
     ingress, install_root, hermes_bin, hermes_home = _trusted_grace_runtime(tmp_path)
 
-    def fake_run(argv, **_kwargs):
+    original_run = ingress.subprocess.run
+
+    def fake_run(argv, **kwargs):
+        if ingress._RUNTIME_PROBE in argv:
+            return original_run(argv, **kwargs)
         return subprocess.CompletedProcess(
             argv, 0,
             stdout='{"tool_definition_names":["terminal"],"resolved_tool_names":["terminal"],"toolset":"context_engine","valid":true}\n',
@@ -126,7 +131,7 @@ def test_grace_ingress_chat_argv_cannot_enable_any_non_context_engine_toolset(tm
     original_run = ingress.subprocess.run
 
     def capture_run(argv, **kwargs):
-        invoked.append(argv)
+        invoked.append((argv, kwargs))
         return original_run(argv, **kwargs)
 
     runtime = ingress.HermesRuntime(
@@ -140,9 +145,15 @@ def test_grace_ingress_chat_argv_cannot_enable_any_non_context_engine_toolset(tm
     )
 
     assert response["ok"] is True
-    assert invoked[0][1:3] == ["-I", "-c"]
-    assert invoked[0][6:10] == ["chat", "--toolsets", "context_engine", "--query"]
-    assert invoked[0][11:] == ["--quiet", "--max-turns", "1", "--source", "suur-grace-ingress"]
+    argv, kwargs = invoked[0]
+    assert argv[0] == str(install_root / "venv" / "bin" / "python3")
+    assert argv[1:3] == ["-I", "-c"]
+    assert argv[6:10] == ["chat", "--toolsets", "context_engine", "--query"]
+    assert argv[11:] == ["--quiet", "--max-turns", "1", "--source", "suur-grace-ingress"]
+    assert kwargs["executable"] == ingress._fd_exec_path(runtime._installation.runtime_python.descriptor)
+    assert set(kwargs["pass_fds"]) == {
+        runtime._installation.runtime_python.descriptor, runtime._installation.launcher.descriptor,
+    }
 
 
 def test_grace_decision_callback_uses_configured_tailscale_https_port(monkeypatch):
@@ -263,15 +274,14 @@ def _grace_ingress_module():
 
 
 def _trusted_grace_runtime(tmp_path):
-    """Build a small, real paired launcher/runtime installation for ingress tests."""
+    """Build a real copied-CPython venv and paired launcher for ingress tests."""
     ingress = _grace_ingress_module()
     install_root = tmp_path / "installed-hermes"
     launcher = install_root / "bin" / "hermes"
     runtime_python = install_root / "venv" / "bin" / "python3"
-    runtime_python.parent.mkdir(parents=True)
+    venv.EnvBuilder(with_pip=False, symlinks=False, clear=True).create(install_root / "venv")
+    assert stat.S_ISREG(runtime_python.lstat().st_mode), "test venv must retain a copied CPython binary"
     launcher.parent.mkdir()
-    runtime_python.write_text(f"#!/bin/sh\nexec {sys.executable} \"$@\"\n", encoding="utf-8")
-    runtime_python.chmod(0o700)
     launcher.write_text(
         f"#!{runtime_python}\nprint('Grace received the proposal.')\n",
         encoding="utf-8",
@@ -293,6 +303,81 @@ def _trusted_grace_runtime(tmp_path):
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text("{}\n", encoding="utf-8")
     return ingress, install_root, launcher, hermes_home
+
+
+def test_grace_ingress_real_cpython_fd_execution_preserves_venv_and_runs_launcher(tmp_path):
+    """The retained executable FD keeps CPython's venv prefix and stdlib imports."""
+    ingress, install_root, launcher, hermes_home = _trusted_grace_runtime(tmp_path)
+    installation = ingress.HermesInstallation(launcher, hermes_home, install_root)
+    try:
+        runtime = json.loads(installation.run_runtime_probe(timeout_seconds=3).stdout)
+        resolver = json.loads(installation.run_resolver_probe(timeout_seconds=3).stdout)
+        launched = installation.run_launcher(
+            ["chat", "--toolsets", "context_engine", "--query", "data", "--quiet", "--max-turns", "1"],
+            timeout_seconds=3,
+        )
+    finally:
+        installation.close()
+
+    assert runtime["implementation"] == "cpython"
+    assert Path(runtime["prefix"]).resolve() == install_root / "venv"
+    assert Path(runtime["executable"]).resolve() == install_root / "venv" / "bin" / "python3"
+    assert runtime["encodings"]
+    assert resolver == {
+        "toolset": "context_engine", "valid": True, "resolved_tool_names": [], "tool_definition_names": [],
+    }
+    assert launched.stdout.strip() == "Grace received the proposal."
+
+
+def test_grace_ingress_verify_only_runs_the_live_descriptor_readiness_gate(tmp_path):
+    """The documented readiness command reaches real CPython FD execution."""
+    _ingress, install_root, launcher, hermes_home = _trusted_grace_runtime(tmp_path)
+    key_file = tmp_path / "grace-shared-key"
+    key_file.write_text("test-key\n", encoding="utf-8")
+    key_file.chmod(0o600)
+    spool_dir = tmp_path / "spool"
+    spool_dir.mkdir(mode=0o700)
+    script = Path(__file__).parent.parent / "scripts" / "grace_hermes_ingress.py"
+
+    completed = subprocess.run(
+        [
+            sys.executable, str(script),
+            "--shared-key-file", str(key_file), "--spool-dir", str(spool_dir),
+            "--hermes-home", str(hermes_home), "--hermes-bin", str(launcher),
+            "--hermes-install-root", str(install_root), "--verify-only",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_grace_ingress_uses_platform_descriptor_exec_paths(monkeypatch, platform):
+    ingress = _grace_ingress_module()
+    monkeypatch.setattr(ingress.sys, "platform", platform)
+
+    expected = "/proc/self/fd/9" if platform == "linux" else "/dev/fd/9"
+    assert ingress._fd_exec_path(9) == expected
+
+
+def test_grace_ingress_rejects_symlink_and_shell_wrapper_runtimes(tmp_path):
+    ingress, install_root, launcher, hermes_home = _trusted_grace_runtime(tmp_path)
+    runtime_python = install_root / "venv" / "bin" / "python3"
+    runtime_python.unlink()
+    runtime_python.symlink_to(sys.executable)
+
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        ingress.HermesInstallation(launcher, hermes_home, install_root)
+
+    runtime_python.unlink()
+    runtime_python.write_text(f"#!/bin/sh\nexec {sys.executable} \"$@\"\n", encoding="utf-8")
+    runtime_python.chmod(0o700)
+    with pytest.raises(ValueError, match="copied CPython binary"):
+        ingress.HermesInstallation(launcher, hermes_home, install_root)
 
 
 def test_grace_ingress_chat_executes_validated_launcher_fd_when_path_is_replaced(tmp_path, monkeypatch):
@@ -418,8 +503,12 @@ def test_zero_toolset_preflight_rejects_malformed_installed_resolver_evidence(tm
     ingress, install_root, hermes_bin, hermes_home = _trusted_grace_runtime(tmp_path)
     calls = []
 
+    original_run = ingress.subprocess.run
+
     def fake_run(argv, **kwargs):
         calls.append((argv, kwargs))
+        if ingress._RUNTIME_PROBE in argv:
+            return original_run(argv, **kwargs)
         return subprocess.CompletedProcess(argv, 0, stdout="not-json\n")
 
     monkeypatch.setattr(ingress.subprocess, "run", fake_run)
@@ -427,9 +516,10 @@ def test_zero_toolset_preflight_rejects_malformed_installed_resolver_evidence(tm
     with pytest.raises(ValueError, match="malformed toolset evidence"):
         ingress.verify_zero_toolset(hermes_bin, hermes_home, install_root, timeout_seconds=3)
 
-    assert calls[0][0][0].startswith("/proc/self/fd/")
+    assert calls[0][0][0] == str(install_root / "venv" / "bin" / "python3")
     assert calls[0][0][1:3] == ["-I", "-c"]
-    assert calls[0][1]["env"]["HERMES_HOME"] == str(hermes_home)
+    assert calls[0][1]["executable"].startswith("/proc/self/fd/")
+    assert calls[1][1]["env"]["HERMES_HOME"] == str(hermes_home)
 
 
 def test_installed_hermes_context_engine_rejects_a_group_writable_install_root(tmp_path):

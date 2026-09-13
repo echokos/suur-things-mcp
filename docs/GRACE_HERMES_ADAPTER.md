@@ -48,14 +48,19 @@ ingress binds a port, it captures descriptor-bound identities for the configured
 install root, launcher directory/binary, `venv/bin` runtime Python, resolver
 modules, Grace profile, and config. Every component must have an absolute,
 stable path with secure owner/mode; the install root and launcher/runtime source
-must not be group- or world-writable. The resolver runs through the captured
-runtime descriptor and verifies that both the named toolset and final registered
-schema resolve to no tools. Each delivery revalidates those identities and
-executes the retained launcher descriptor (`/proc/self/fd` on Linux, `/dev/fd`
-on macOS), so a path replacement between validation and exec cannot redirect
-the chat process. Changed, retargeted, malformed, missing, or nonzero components
-fail closed. `hermes --version` output is never an authority for the install
-root or runtime pairing.
+must not be group- or world-writable. `venv/bin/python3` must be a copied,
+regular CPython binary -- never a symlink or shell wrapper. The resolver runs
+through the retained runtime descriptor while the validated canonical runtime
+path is kept as CPython's `argv[0]`; the descriptor is the actual executable
+(`/proc/self/fd` on Linux, `/dev/fd` on macOS), so CPython preserves its venv
+prefix and site-packages without executing a mutable runtime pathname. The
+ingress proves CPython, its venv prefix, and an `encodings` import before
+verifying that the named toolset and final registered schema resolve to no tools.
+Each delivery revalidates those identities and executes retained launcher content
+through that runtime, never the launcher's shebang, so a path replacement between
+validation and exec cannot redirect the chat process. Changed, retargeted,
+malformed, missing, or nonzero components fail closed. `hermes --version` output
+is never an authority for the install root or runtime pairing.
 There is no fallback to default tools, `safe`, prompt-only restrictions, or
 `--safe-mode`; an invocation can only use the fixed `context_engine` value.
 
@@ -75,6 +80,20 @@ tailscale serve --bg --https=8444 http://127.0.0.1:8790
 python3 /fixed/suur-checkout/scripts/smoke_grace_hermes_ingress.py \
   --url https://grace-host.tailnet.ts.net:8444/api/suur/grace/proposals \
   --shared-key-file /etc/suur-grace-ingress/grace-shared-key
+```
+
+Before enabling or after upgrading the ingress, run its live descriptor
+readiness gate as the service account. `--verify-only` exercises retained-FD
+CPython execution (including `encodings` and venv-prefix checks) and the real
+installed zero-tool resolver without binding a port:
+
+```sh
+sudo -u grace /usr/bin/python3 /opt/suur-things-mcp/scripts/grace_hermes_ingress.py \
+  --shared-key-file /etc/suur-grace-ingress/grace-shared-key \
+  --spool-dir /var/lib/suur-grace-ingress/proposals \
+  --hermes-home /home/grace/.hermes/profiles/grace \
+  --hermes-bin /opt/hermes/bin/hermes --hermes-install-root /opt/hermes \
+  --verify-only
 ```
 
 Set `SUUR_HERMES_GRACE_URL` on the Things Mac to the resulting private Tailscale
