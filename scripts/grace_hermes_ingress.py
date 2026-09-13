@@ -54,6 +54,47 @@ print(json.dumps({
 }, sort_keys=True))
 """
 
+_BOUND_LAUNCHER_EXEC = """\
+import hashlib
+import json
+import os
+import stat
+import sys
+
+
+def identity(details):
+    return {
+        "device": details.st_dev,
+        "inode": details.st_ino,
+        "owner": details.st_uid,
+        "mode": stat.S_IMODE(details.st_mode),
+        "file_type": stat.S_IFMT(details.st_mode),
+    }
+
+
+records = json.loads(sys.argv[1])
+launcher_fd_path = sys.argv[2]
+launcher_arguments = sys.argv[3:]
+for record in records:
+    path = record["path"]
+    if identity(os.lstat(path)) != record["logical"]:
+        raise SystemExit(125)
+    if identity(os.stat(path)) != record["target"]:
+        raise SystemExit(125)
+    if os.path.realpath(path) != record["canonical"]:
+        raise SystemExit(125)
+    digest = record.get("content_digest")
+    if digest is not None:
+        with open(path, "rb") as source:
+            if hashlib.file_digest(source, "sha256").hexdigest() != digest:
+                raise SystemExit(125)
+
+sys.argv = [launcher_fd_path, *launcher_arguments]
+with open(launcher_fd_path, "rb") as source:
+    code = compile(source.read(), launcher_fd_path, "exec")
+exec(code, {"__name__": "__main__", "__file__": launcher_fd_path})
+"""
+
 
 class _FileIdentity:
     """The stable portions of a filesystem object identity we can recheck."""
@@ -77,6 +118,15 @@ class _FileIdentity:
             mode=stat.S_IMODE(details.st_mode),
             file_type=stat.S_IFMT(details.st_mode),
         )
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "device": self.device,
+            "inode": self.inode,
+            "owner": self.owner,
+            "mode": self.mode,
+            "file_type": self.file_type,
+        }
 
 
 def _safe_owner(details: os.stat_result, description: str) -> None:
@@ -214,6 +264,15 @@ class _BoundPath:
         finally:
             os.close(descriptor)
 
+    def execution_record(self) -> dict[str, object]:
+        return {
+            "path": str(self.configured_path),
+            "canonical": str(self.canonical_path),
+            "logical": self.logical_identity.as_dict(),
+            "target": self.target_identity.as_dict(),
+            "content_digest": self.content_digest,
+        }
+
     def close(self) -> None:
         os.close(self.descriptor)
 
@@ -300,8 +359,8 @@ class HermesInstallation:
             self.hermes_home.canonical_path / "config.yaml", "Grace Hermes config", bind_content=True,
         )
 
-    def assert_unchanged(self) -> None:
-        for bound, description in (
+    def _bound_components(self) -> tuple[tuple[_BoundPath, str], ...]:
+        return (
             (self.install_root, "--hermes-install-root"),
             (self.launcher_directory, "Hermes launcher directory"),
             (self.launcher, "--hermes-bin"),
@@ -312,8 +371,18 @@ class HermesInstallation:
             (self.model_tools, "Hermes model tool module"),
             (self.hermes_home, "--hermes-home"),
             (self.profile_config, "Grace Hermes config"),
-        ):
+        )
+
+    def assert_unchanged(self) -> None:
+        for bound, description in self._bound_components():
             bound.assert_unchanged(description)
+
+    def execution_records(self) -> str:
+        return json.dumps(
+            [bound.execution_record() for bound, _description in self._bound_components()],
+            separators=(",", ":"),
+            sort_keys=True,
+        )
 
     def run_resolver_probe(self, *, timeout_seconds: int) -> subprocess.CompletedProcess[str]:
         self.assert_unchanged()
@@ -331,14 +400,17 @@ class HermesInstallation:
     def run_launcher(self, arguments: list[str], *, timeout_seconds: int) -> subprocess.CompletedProcess[str]:
         self.assert_unchanged()
         return subprocess.run(
-            [_fd_exec_path(self.launcher.descriptor), *arguments],
+            [
+                _fd_exec_path(self.runtime_python.descriptor), "-I", "-c", _BOUND_LAUNCHER_EXEC,
+                self.execution_records(), _fd_exec_path(self.launcher.descriptor), *arguments,
+            ],
             check=True,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
             cwd=self.install_root.canonical_path,
             env=_hermes_environment(self.hermes_home.canonical_path),
-            pass_fds=(self.launcher.descriptor,),
+            pass_fds=(self.runtime_python.descriptor, self.launcher.descriptor),
         )
 
     def close(self) -> None:

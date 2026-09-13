@@ -140,8 +140,9 @@ def test_grace_ingress_chat_argv_cannot_enable_any_non_context_engine_toolset(tm
     )
 
     assert response["ok"] is True
-    assert invoked[0][1:5] == ["chat", "--toolsets", "context_engine", "--query"]
-    assert invoked[0][6:] == ["--quiet", "--max-turns", "1", "--source", "suur-grace-ingress"]
+    assert invoked[0][1:3] == ["-I", "-c"]
+    assert invoked[0][6:10] == ["chat", "--toolsets", "context_engine", "--query"]
+    assert invoked[0][11:] == ["--quiet", "--max-turns", "1", "--source", "suur-grace-ingress"]
 
 
 def test_grace_decision_callback_uses_configured_tailscale_https_port(monkeypatch):
@@ -271,7 +272,10 @@ def _trusted_grace_runtime(tmp_path):
     launcher.parent.mkdir()
     runtime_python.write_text(f"#!/bin/sh\nexec {sys.executable} \"$@\"\n", encoding="utf-8")
     runtime_python.chmod(0o700)
-    launcher.write_text("#!/bin/sh\nprintf '%s\\n' 'Grace received the proposal.'\n", encoding="utf-8")
+    launcher.write_text(
+        f"#!{runtime_python}\nprint('Grace received the proposal.')\n",
+        encoding="utf-8",
+    )
     launcher.chmod(0o700)
     resolver_source = install_root / "resolver"
     resolver_source.mkdir()
@@ -319,6 +323,43 @@ def test_grace_ingress_chat_executes_validated_launcher_fd_when_path_is_replaced
     assert not marker.exists()
 
 
+def test_grace_ingress_fails_closed_when_console_script_interpreter_is_replaced_at_exec(tmp_path, monkeypatch):
+    """A console-script shebang cannot resolve a replacement runtime after preflight."""
+    ingress, install_root, launcher, hermes_home = _trusted_grace_runtime(tmp_path)
+    runtime_python = install_root / "venv" / "bin" / "python3"
+    launcher.write_text(
+        f"#!{runtime_python}\nimport sys\nprint('Grace received the proposal.')\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o700)
+    runtime = ingress.HermesRuntime(
+        str(launcher), hermes_home, tmp_path / "spool", 3, hermes_install_root=install_root,
+    )
+    runtime.verify_zero_toolset()
+    marker = tmp_path / "malicious-runtime-ran"
+    replacement = tmp_path / "replacement-python3"
+    replacement.write_text(
+        f"#!/bin/sh\n: > {marker}\nexec {sys.executable} \"$@\"\n",
+        encoding="utf-8",
+    )
+    replacement.chmod(0o700)
+    original_run = ingress.subprocess.run
+
+    def replace_between_check_and_exec(argv, **kwargs):
+        if "chat" in argv:
+            os.replace(replacement, runtime_python)
+        return original_run(argv, **kwargs)
+
+    monkeypatch.setattr(ingress.subprocess, "run", replace_between_check_and_exec)
+
+    response = runtime.deliver(
+        b'{"profile":"grace","proposal_id":"runtime-swap","task_data":{"title":"data"}}', "runtime-swap",
+    )
+
+    assert response == {"ok": False, "proposal_id": "runtime-swap", "status": "grace_unavailable"}
+    assert not marker.exists()
+
+
 def test_grace_ingress_pins_zero_toolset_in_exact_argv_after_failure_and_retry(tmp_path, monkeypatch):
     """A transient Hermes failure must never make a retry fall back to default tools."""
     ingress, install_root, hermes_bin, hermes_home = _trusted_grace_runtime(tmp_path)
@@ -354,7 +395,7 @@ def test_grace_ingress_pins_zero_toolset_in_exact_argv_after_failure_and_retry(t
         "chat", "--toolsets", "context_engine", "--query", prompt,
         "--quiet", "--max-turns", "1", "--source", "suur-grace-ingress",
     ]
-    assert [argv[1:] for argv, _kwargs in calls] == [expected, expected]
+    assert [argv[6:] for argv, _kwargs in calls] == [expected, expected]
     assert all(kwargs["env"]["HERMES_HOME"] == str(hermes_home) for _argv, kwargs in calls)
 
 
