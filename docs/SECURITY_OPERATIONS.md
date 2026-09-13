@@ -14,23 +14,33 @@ Run `scripts/install_private_tailscale_serve.sh` **locally on the Things Mac**. 
 LaunchAgent, and configures `tailscale serve --https=443` to proxy only to
 `127.0.0.1:8765`. The LaunchAgent never invokes `uvx` or resolves a package at startup.
 
-Before installing, arrange the dashboard bootstrap token and (if dashboard write access
-is wanted) the Things URL-scheme token in the Mac's local service secret manager. Do not
-place either value in the plist, this repository, the shell history, or a browser. The
-installer intentionally does not create a public Funnel endpoint or bind the application
-to a LAN/WAN interface.
+The installer creates `~/.config/suur-things-mcp/secrets/` with mode 0700 and
+regular 0600 `browser-bootstrap` and `grace-shared-key` files. The LaunchAgent
+receives only `SUUR_SECRET_DIR`, never the values. Put the Things URL-scheme
+token in its existing protected local file. Do not place any value in the plist,
+repository, shell history, browser, or a command line. The installer intentionally
+does not create a public Funnel endpoint or bind the application to a LAN/WAN
+interface.
 
 ## Browser access
 
-Set `SUUR_DASHBOARD_BOOTSTRAP_TOKEN` in the service environment. The reverse proxy must authenticate the Tailscale identity and inject that value into `X-Suur-Bootstrap` only for an approved browser-session bootstrap request; do not put it in HTML, JavaScript, URLs, local storage, browser configuration, or logs.
+Normal browser bootstrap uses the authenticated `Tailscale-User-Login` header
+that Tailscale Serve strips and rewrites itself. SUUR requires HTTPS plus an
+explicit `SUUR_TAILSCALE_USERS` allowlist; it does not make every tailnet member
+an administrator. The local 0600 `browser-bootstrap` value is break-glass only.
+Do not put it in HTML, JavaScript, URLs, local storage, browser configuration,
+or logs.
 
 `POST /api/session` exchanges that header for `__Host-suur-session` (Secure, HttpOnly, SameSite=Strict) and a non-credential CSRF cookie. All API calls require a scoped session; mutations additionally require `X-Suur-CSRF` and a unique `Idempotency-Key`. `POST /api/session/revoke` revokes the current session immediately. Rotate the bootstrap token after access-policy changes.
 
-Grace proposals are delivered server-side to the configured `SUUR_HERMES_GRACE_URL`.
-`SUUR_HERMES_GRACE_TOKEN`, when used, is sent only as a server-side bearer credential.
-The browser receives a bounded proposal and must later POST the matching confirmation to
-`/api/grace/confirm`; only then does the service apply its whitelisted change through the
-same authenticated, idempotency-guarded, stable-ID-readback update path as dashboard edits.
+Grace proposals are delivered server-side to the configured `SUUR_HERMES_GRACE_URL`
+with an HMAC envelope from the 0600 `grace-shared-key` file. The concrete,
+profile-bound web-chat decision adapter is `scripts/grace_hermes_decide.py`; its
+installation and fixed wire contract are in `GRACE_HERMES_ADAPTER.md`. A browser
+approval at `/api/grace/confirm` is bound to the authenticated browser session
+but does not mutate. A single signed `profile=grace`, `scope=update` callback
+must approve the same proposal before the service applies its whitelisted change
+through the authenticated, idempotency-guarded, stable-ID-readback update path.
 The service never shells out to a general agent runner.
 
 `GET /api/healthz` is liveness-only. `GET /api/readyz` returns 503 if Things data cannot be read and never includes paths, task data, tokens, or diagnostics.
@@ -57,4 +67,4 @@ uv run pytest
 uv run ruff check .
 ```
 
-Before upgrade, back up the Things database through Things/macOS tooling and the SUUR configuration/security databases. Test the upgraded service against a copy of Things data. On Things failure, leave writes disabled, inspect `/api/readyz`, and restore service only after a read-only health check passes. There is no production deployment step in this repository.
+Before upgrade, back up the Things database through Things/macOS tooling and the SUUR configuration/security databases. Test the upgraded service against a copy of Things data. On Things failure, leave writes disabled, inspect `/api/readyz`, and restore service only after a read-only health check passes. To roll back, `launchctl bootout gui/$(id -u)/io.suur.things-dashboard`, restore the prior fixed checkout/venv symlink and security database backup, then rerun the private installer. To remove it, run `suur-things-mcp dashboard --uninstall-service` and `tailscale serve reset`; preserve or securely destroy the local secret directory according to whether a later reinstall must retain existing sessions. There is no production deployment step in this repository.

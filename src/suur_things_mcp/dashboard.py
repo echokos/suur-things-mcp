@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -34,6 +36,7 @@ import time
 import urllib.request
 from importlib.resources import files as _pkg_files
 from typing import Any
+from xml.sax.saxutils import escape
 
 import uvicorn
 from starlette.applications import Starlette
@@ -48,7 +51,7 @@ from starlette.routing import Route
 from . import __version__, reads
 from . import config as boardcfg
 from .grace_adapter import GraceProposalAdapter
-from .security import SecurityStore, default_store
+from .security import SecurityStore, default_store, service_secret
 from .urlscheme import ThingsURLError, execute
 
 # In-memory organize jobs (single uvicorn worker). job_id -> dict.
@@ -91,7 +94,9 @@ class _SessionGuard(BaseHTTPMiddleware):
         self._store = store
 
     async def dispatch(self, request: Request, call_next):
-        if not request.url.path.startswith("/api/") or request.url.path in {"/api/healthz", "/api/readyz", "/api/session"}:
+        if not request.url.path.startswith("/api/") or request.url.path in {
+            "/api/healthz", "/api/readyz", "/api/session", "/api/grace/decision"
+        }:
             return await call_next(request)
         scope = _scope_for_request(request)
         csrf = request.headers.get("X-Suur-CSRF") if request.method != "GET" else request.cookies.get("__Host-suur-csrf")
@@ -219,13 +224,40 @@ async def _version(_request: Request) -> JSONResponse:
 _WEB_SCOPES = frozenset({"read", "create", "update", "complete", "move", "schedule", "checklist", "propose"})
 
 
-async def _create_session(request: Request) -> JSONResponse:
-    """Exchange a reverse-proxy-injected bootstrap secret for secure browser cookies."""
-    bootstrap = os.environ.get("SUUR_DASHBOARD_BOOTSTRAP_TOKEN")
+def _tailscale_users() -> set[str]:
+    """Explicit users allowed to bootstrap a browser session through Serve.
+
+    Tailscale Serve removes client-provided identity headers and sets
+    ``Tailscale-User-Login`` itself.  The application is loopback-only, but we
+    still require a configured allowlist rather than treating every tailnet
+    member as a dashboard administrator.
+    """
+    configured = os.environ.get("SUUR_TAILSCALE_USERS", "")
+    return {user.strip().casefold() for user in configured.split(",") if user.strip()}
+
+
+def _browser_bootstrap_principal(request: Request) -> str | None:
+    """Authenticate a browser bootstrap without exposing a secret to page code."""
+    bootstrap = service_secret("browser-bootstrap", "SUUR_DASHBOARD_BOOTSTRAP_TOKEN")
     supplied = request.headers.get("X-Suur-Bootstrap")
-    if not bootstrap or not supplied or not secrets.compare_digest(bootstrap, supplied):
+    if bootstrap and supplied and secrets.compare_digest(bootstrap, supplied):
+        return "dashboard-browser"
+
+    # This is intentionally an allowlist, not a presence check.  A local
+    # process can reach loopback, so it is part of the trusted Mac boundary;
+    # remote browsers must arrive from HTTPS Tailscale Serve with an identity.
+    login = (request.headers.get("Tailscale-User-Login") or "").strip().casefold()
+    if request.headers.get("X-Forwarded-Proto", "").casefold() == "https" and login in _tailscale_users():
+        return f"tailscale:{login}"
+    return None
+
+
+async def _create_session(request: Request) -> JSONResponse:
+    """Issue secure cookies after a secret or authenticated Serve bootstrap."""
+    principal = _browser_bootstrap_principal(request)
+    if principal is None:
         return JSONResponse({"ok": False, "error": "bootstrap authentication required"}, status_code=401)
-    issued = request.app.state.security_store.issue_session(_WEB_SCOPES, "dashboard-browser")
+    issued = request.app.state.security_store.issue_session(_WEB_SCOPES, principal)
     response = JSONResponse({"ok": True, "session_id": issued.session_id, "scopes": sorted(issued.scopes)})
     response.set_cookie("__Host-suur-session", issued.token, secure=True, httponly=True, samesite="strict", path="/")
     # CSRF is deliberately not a credential; JS can read only this random double-submit value.
@@ -705,16 +737,18 @@ async def _organize_post(_request: Request) -> JSONResponse:
 
 
 async def _grace_propose(request: Request) -> JSONResponse:
-    """Send a bounded proposal to Grace; only a later authenticated confirm can write."""
+    """Persist and deliver a bounded proposal; neither caller can write alone."""
     body = await _json_body(request)
     if body is None:
         return JSONResponse({"ok": False, "error": "invalid JSON body"}, status_code=400)
     try:
         proposal = _GRACE.propose(body)
+        request.app.state.security_store.create_grace_proposal(
+            proposal["id"], request.state.session_id, request.state.principal, proposal["change"]
+        )
         try:
-            await run_in_threadpool(_dispatch_grace_request, _GRACE.request_payload(body))
+            await run_in_threadpool(_dispatch_grace_request, _GRACE.request_payload(proposal["id"], body))
         except RuntimeError as exc:
-            _GRACE.discard(proposal["id"])
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
         return JSONResponse({"ok": True, "proposal": proposal})
     except ValueError as exc:
@@ -722,15 +756,22 @@ async def _grace_propose(request: Request) -> JSONResponse:
 
 
 def _dispatch_grace_request(payload: str) -> None:
-    """Deliver a proposal to the configured Hermes/Grace server, never via a shell."""
+    """Deliver a signed proposal to the configured Hermes/Grace web adapter."""
     endpoint = os.environ.get("SUUR_HERMES_GRACE_URL")
     if not endpoint:
         raise RuntimeError("SUUR_HERMES_GRACE_URL is not configured")
-    token = os.environ.get("SUUR_HERMES_GRACE_TOKEN")
-    headers = {"Content-Type": "application/json", "X-Suur-Source": "dashboard"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    request = urllib.request.Request(endpoint, data=payload.encode("utf-8"), headers=headers, method="POST")
+    key = _grace_shared_key()
+    if not key:
+        raise RuntimeError("SUUR_GRACE_SHARED_KEY is not configured")
+    body = payload.encode("utf-8")
+    timestamp = str(int(time.time()))
+    headers = {
+        "Content-Type": "application/json",
+        "X-Suur-Source": "dashboard",
+        "X-Suur-Grace-Timestamp": timestamp,
+        "X-Suur-Grace-Signature": _grace_signature(key, timestamp, body),
+    }
+    request = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=5) as response:
             if not 200 <= response.status < 300:
@@ -740,14 +781,79 @@ def _dispatch_grace_request(payload: str) -> None:
 
 
 async def _grace_confirm(request: Request) -> JSONResponse:
-    """Consume an explicit confirmation and apply the bounded change through _apply_update."""
+    """Record Elliott's one-time browser approval; it has no mutation authority."""
     body = await _json_body(request)
     if body is None:
         return JSONResponse({"ok": False, "error": "invalid JSON body"}, status_code=400)
-    change = _GRACE.confirmed_change(str(body.get("id") or ""), body.get("confirmation"))
+    proposal_id = str(body.get("id") or "")
+    store = request.app.state.security_store
+    if not store.approve_grace_proposal_from_browser(proposal_id, request.state.session_id):
+        return JSONResponse({"ok": False, "error": "invalid, foreign, or already approved Grace proposal"}, status_code=409)
+    response = await _apply_ready_grace_mutation(store, proposal_id)
+    return response or JSONResponse({"ok": True, "status": "awaiting_grace"}, status_code=202)
+
+
+def _grace_shared_key() -> str | None:
+    return service_secret("grace-shared-key", "SUUR_GRACE_SHARED_KEY")
+
+
+def _grace_signature(key: str, timestamp: str, body: bytes) -> str:
+    return hmac.new(key.encode("utf-8"), f"{timestamp}.".encode("ascii") + body, hashlib.sha256).hexdigest()
+
+
+def _valid_grace_callback(request: Request, body: bytes) -> bool:
+    key = _grace_shared_key()
+    timestamp = request.headers.get("X-Suur-Grace-Timestamp")
+    supplied = request.headers.get("X-Suur-Grace-Signature")
+    if not key or not timestamp or not supplied:
+        return False
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
+            return False
+    except ValueError:
+        return False
+    return secrets.compare_digest(supplied, _grace_signature(key, timestamp, body))
+
+
+async def _apply_ready_grace_mutation(store: SecurityStore, proposal_id: str) -> JSONResponse | None:
+    """Claim the dual-approved request exactly once, then use normal Things readback."""
+    change = store.claim_ready_grace_mutation(proposal_id)
     if change is None:
-        return JSONResponse({"ok": False, "error": "invalid or expired Grace confirmation"}, status_code=409)
-    return await _apply_update(change)
+        return None
+    response = await _apply_update(change)
+    try:
+        result = json.loads(response.body)
+        succeeded = response.status_code < 400 and result.get("applied") is True
+    except (ValueError, AttributeError):
+        succeeded = False
+    store.finish_grace_mutation(proposal_id, succeeded)
+    return response
+
+
+async def _grace_decision(request: Request) -> JSONResponse:
+    """Accept one HMAC-authenticated, update-scoped Grace decision callback."""
+    raw = bytes(await request.body())
+    if not _valid_grace_callback(request, raw):
+        return JSONResponse({"ok": False, "error": "Grace callback authentication required"}, status_code=401)
+    try:
+        body = json.loads(raw)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"ok": False, "error": "invalid JSON body"}, status_code=400)
+    proposal_id = str(body.get("proposal_id") or "")
+    approved = body.get("approved") is True
+    store = request.app.state.security_store
+    accepted = store.record_grace_decision(
+        proposal_id, str(body.get("decision_id") or ""), str(body.get("profile") or ""),
+        body.get("scopes") if isinstance(body.get("scopes"), list) else [], approved,
+    )
+    if not accepted:
+        return JSONResponse({"ok": False, "error": "invalid, duplicate, or unauthorized Grace decision"}, status_code=409)
+    if not approved:
+        return JSONResponse({"ok": True, "status": "denied"})
+    response = await _apply_ready_grace_mutation(store, proposal_id)
+    return response or JSONResponse({"ok": True, "status": "awaiting_browser"}, status_code=202)
 
 
 async def _organize_get(request: Request) -> JSONResponse:
@@ -778,6 +884,7 @@ def create_app(port: int = DEFAULT_PORT, security_store: SecurityStore | None = 
             Route("/api/organize", _organize_post, methods=["POST"]),
             Route("/api/grace/propose", _grace_propose, methods=["POST"]),
             Route("/api/grace/confirm", _grace_confirm, methods=["POST"]),
+            Route("/api/grace/decision", _grace_decision, methods=["POST"]),
             Route("/api/sidebar", _sidebar),
             Route("/api/items", _items),
             Route("/api/item", _item),
@@ -916,6 +1023,14 @@ def _service_command() -> list[str]:
 def _service_plist(cmd: list[str]) -> str:
     log = os.path.expanduser("~/Library/Logs/suur-things-dashboard.log")
     args = "\n".join(f"    <string>{c}</string>" for c in cmd)
+    secret_dir = os.path.expanduser(
+        os.environ.get("SUUR_SECRET_DIR", "~/.config/suur-things-mcp/secrets")
+    )
+    tailscale_users = os.environ.get("SUUR_TAILSCALE_USERS", "")
+    environment = "\n".join(
+        f"    <key>{name}</key><string>{escape(value)}</string>"
+        for name, value in (("SUUR_SECRET_DIR", secret_dir), ("SUUR_TAILSCALE_USERS", tailscale_users))
+    )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -927,6 +1042,10 @@ def _service_plist(cmd: list[str]) -> str:
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+{environment}
+  </dict>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
 </dict>

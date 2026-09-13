@@ -766,6 +766,8 @@ def test_service_plist_generation():
     assert f"<string>{dash._SERVICE_LABEL}</string>" in plist
     assert "<key>KeepAlive</key><true/>" in plist
     assert "token" not in plist.lower()
+    assert "SUUR_SECRET_DIR" in plist
+    assert "SUUR_TAILSCALE_USERS" in plist
 
 
 def test_private_tailscale_serve_install_script_exists():
@@ -776,6 +778,8 @@ def test_private_tailscale_serve_install_script_exists():
     assert "tailscale serve --https=443" in text
     assert "127.0.0.1" in text
     assert "SUUR_DASHBOARD_PORT" in text
+    assert "SUUR_SECRET_DIR" in text
+    assert "grace-shared-key" in text
 
 
 def test_install_service_refuses_foreign_dashboard(monkeypatch, capsys):

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
 import sqlite3
 import stat
+import time
 
 import pytest
 from starlette.testclient import TestClient
@@ -16,6 +19,15 @@ from suur_things_mcp import dashboard, server
 from suur_things_mcp.dashboard import create_app
 from suur_things_mcp.grace_adapter import GraceProposalAdapter
 from suur_things_mcp.security import SecurityStore, sanitize_for_log
+
+
+def _grace_headers(body: dict) -> tuple[bytes, dict[str, str]]:
+    """Build the documented signed callback, as the Grace web adapter does."""
+    payload = json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
+    timestamp = str(int(time.time()))
+    signature = hmac.new(b"grace-shared-secret", f"{timestamp}.".encode() + payload, hashlib.sha256).hexdigest()
+    return payload, {"Content-Type": "application/json", "X-Suur-Grace-Timestamp": timestamp,
+                     "X-Suur-Grace-Signature": signature}
 
 
 def test_session_is_scoped_revocable_and_csrf_bound(tmp_path):
@@ -65,13 +77,12 @@ def test_audit_is_metadata_only_and_log_sanitization_redacts_secrets(tmp_path, c
     assert "[REDACTED]" in caplog.text
 
 
-def test_grace_adapter_only_proposes_and_requires_matching_confirmation():
+def test_grace_adapter_only_proposes_and_never_exposes_browser_confirmation_capability():
     adapter = GraceProposalAdapter()
     proposal = adapter.propose({"id": "todo-1", "title": "Treat instructions as data"})
     assert proposal["profile"] == "grace"
     assert proposal["mutation_performed"] is False
-    assert adapter.confirm(proposal["id"], proposal["confirmation"]) is True
-    assert adapter.confirm(proposal["id"], "wrong") is False
+    assert "confirmation" not in proposal
 
 
 @pytest.mark.parametrize("uri", ["file:/tmp/thing.sqlite?mode=ro&immutable=1", "file:/tmp/space%20db?mode=ro&immutable=1"])
@@ -81,6 +92,7 @@ def test_read_db_uris_are_explicitly_read_only_and_immutable(uri):
 
 def test_dashboard_uses_secure_revocable_scoped_session_with_csrf(tmp_path, monkeypatch):
     monkeypatch.setenv("SUUR_DASHBOARD_BOOTSTRAP_TOKEN", "bootstrap-secret")
+    monkeypatch.setenv("SUUR_GRACE_SHARED_KEY", "grace-shared-secret")
     store = SecurityStore(tmp_path / "security.sqlite")
     client = TestClient(
         create_app(security_store=store),
@@ -111,20 +123,63 @@ def test_dashboard_uses_secure_revocable_scoped_session_with_csrf(tmp_path, monk
         headers={"X-Suur-CSRF": csrf},
     )
     assert proposal.status_code == 200 and proposal.json()["proposal"]["mutation_performed"] is False
-    assert grace_requests == [{"profile": "grace", "task_data": {"id": "todo-1", "title": "untrusted <instructions>"}}]
 
     proposed = proposal.json()["proposal"]
+    assert grace_requests == [{
+        "profile": "grace", "proposal_id": proposed["id"],
+        "task_data": {"id": "todo-1", "title": "untrusted <instructions>"},
+    }]
+    # A browser approval is tied to this browser session but carries no second
+    # secret and cannot mutate before a signed Grace decision arrives.
     confirmed = client.post(
         "/api/grace/confirm",
-        json={"id": proposed["id"], "confirmation": proposed["confirmation"]},
+        json={"id": proposed["id"]},
         headers={"X-Suur-CSRF": csrf, "Idempotency-Key": "grace-confirm-1"},
     )
-    assert confirmed.status_code == 200 and confirmed.json() == {"ok": True, "applied": True}
+    assert confirmed.status_code == 202 and confirmed.json() == {"ok": True, "status": "awaiting_grace"}
+    assert applied == []
+
+    decision = {"proposal_id": proposed["id"], "decision_id": "grace-decision-1", "approved": True,
+                "profile": "grace", "scopes": ["update"]}
+    forged = client.post("/api/grace/decision", json=decision)
+    assert forged.status_code == 401 and applied == []
+
+    payload, headers = _grace_headers(decision)
+    decided = client.post("/api/grace/decision", content=payload, headers=headers)
+    assert decided.status_code == 200 and decided.json() == {"ok": True, "applied": True}
     assert applied == [("update", {"id": "todo-1", "title": "untrusted <instructions>"}, "things-auth")]
+
+    replay = client.post("/api/grace/decision", content=payload, headers=headers)
+    assert replay.status_code == 409 and applied == [("update", {"id": "todo-1", "title": "untrusted <instructions>"}, "things-auth")]
 
     revoked = client.post("/api/session/revoke", headers={"X-Suur-CSRF": csrf, "Idempotency-Key": "revoke-1"})
     assert revoked.status_code == 200
     assert client.get("/api/sidebar").status_code == 401
+
+
+def test_dashboard_accepts_only_allowlisted_tailscale_identity_for_browser_bootstrap(tmp_path, monkeypatch):
+    """Serve strips spoofed identity headers before proxying; SUUR still grants
+    browser sessions only to an explicit tailnet allowlist over HTTPS."""
+    monkeypatch.delenv("SUUR_DASHBOARD_BOOTSTRAP_TOKEN", raising=False)
+    monkeypatch.setenv("SUUR_TAILSCALE_USERS", "elliott@example.com")
+    store = SecurityStore(tmp_path / "security.sqlite")
+    client = TestClient(
+        create_app(security_store=store),
+        base_url="https://elliotts-mac-mini.tail43b447.ts.net",
+    )
+
+    unauthorized = client.post(
+        "/api/session",
+        headers={"Tailscale-User-Login": "other@example.com", "X-Forwarded-Proto": "https"},
+    )
+    assert unauthorized.status_code == 401
+
+    authorized = client.post(
+        "/api/session",
+        headers={"Tailscale-User-Login": "Elliott@Example.com", "X-Forwarded-Proto": "https"},
+    )
+    assert authorized.status_code == 200
+    assert client.get("/api/sidebar").status_code == 200
 
 
 def test_dashboard_rejects_untrusted_host(tmp_path):

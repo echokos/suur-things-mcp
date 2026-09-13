@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -97,6 +98,20 @@ class SecurityStore:
                     scopes TEXT NOT NULL,
                     revoked_at INTEGER
                 );
+                CREATE TABLE IF NOT EXISTS grace_proposals (
+                    proposal_id TEXT PRIMARY KEY,
+                    browser_session_id TEXT NOT NULL,
+                    browser_principal TEXT NOT NULL,
+                    change_json TEXT NOT NULL,
+                    browser_approved_at INTEGER,
+                    grace_decision_id TEXT UNIQUE,
+                    grace_profile TEXT,
+                    grace_scopes TEXT,
+                    grace_approved INTEGER,
+                    execution_state TEXT NOT NULL DEFAULT 'pending',
+                    created_at INTEGER NOT NULL,
+                    completed_at INTEGER
+                );
                 """
             )
 
@@ -155,6 +170,79 @@ class SecurityStore:
         with self._connect() as con:
             con.execute("UPDATE mcp_principals SET revoked_at = ? WHERE profile = ?", (int(time.time()), profile))
 
+    def create_grace_proposal(
+        self, proposal_id: str, browser_session_id: str, browser_principal: str, change: dict[str, str]
+    ) -> None:
+        """Persist a browser-bound proposal before delivering it to Grace."""
+        with self._connect() as con:
+            con.execute(
+                "INSERT INTO grace_proposals (proposal_id, browser_session_id, browser_principal, change_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (proposal_id, browser_session_id, browser_principal, json.dumps(change, sort_keys=True), int(time.time())),
+            )
+
+    def approve_grace_proposal_from_browser(self, proposal_id: str, browser_session_id: str) -> bool:
+        """One browser session may approve its own proposal once, never execute it."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT browser_approved_at, execution_state FROM grace_proposals "
+                "WHERE proposal_id = ? AND browser_session_id = ?",
+                (proposal_id, browser_session_id),
+            ).fetchone()
+            if row is None or row["browser_approved_at"] is not None or row["execution_state"] != "pending":
+                return False
+            con.execute("UPDATE grace_proposals SET browser_approved_at = ? WHERE proposal_id = ?", (int(time.time()), proposal_id))
+        return True
+
+    def record_grace_decision(
+        self, proposal_id: str, decision_id: str, profile: str, scopes: Iterable[str], approved: bool
+    ) -> bool:
+        """Accept exactly one signed, update-scoped decision from the Grace profile."""
+        cleaned_scopes = sorted({str(scope) for scope in scopes})
+        if not decision_id or profile != "grace" or "update" not in cleaned_scopes:
+            return False
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT grace_decision_id, execution_state FROM grace_proposals WHERE proposal_id = ?", (proposal_id,)
+            ).fetchone()
+            if row is None or row["grace_decision_id"] is not None or row["execution_state"] != "pending":
+                return False
+            try:
+                con.execute(
+                    "UPDATE grace_proposals SET grace_decision_id = ?, grace_profile = ?, grace_scopes = ?, grace_approved = ? "
+                    "WHERE proposal_id = ?",
+                    (decision_id, profile, json.dumps(cleaned_scopes), int(approved), proposal_id),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def claim_ready_grace_mutation(self, proposal_id: str) -> dict[str, str] | None:
+        """Atomically claim a proposal only after both independent approvals exist."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT change_json FROM grace_proposals WHERE proposal_id = ? AND browser_approved_at IS NOT NULL "
+                "AND grace_approved = 1 AND execution_state = 'pending'",
+                (proposal_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            changed = con.execute(
+                "UPDATE grace_proposals SET execution_state = 'executing' WHERE proposal_id = ? AND execution_state = 'pending'",
+                (proposal_id,),
+            ).rowcount
+            if changed != 1:
+                return None
+        return json.loads(str(row["change_json"]))
+
+    def finish_grace_mutation(self, proposal_id: str, success: bool) -> None:
+        state = "executed" if success else "failed"
+        with self._connect() as con:
+            con.execute(
+                "UPDATE grace_proposals SET execution_state = ?, completed_at = ? WHERE proposal_id = ? AND execution_state = 'executing'",
+                (state, int(time.time()), proposal_id),
+            )
+
     def check_rate_limit(self, principal: str) -> bool:
         now = int(time.time())
         window = now - (now % self.rate_window_seconds)
@@ -203,3 +291,25 @@ def default_store() -> SecurityStore:
         base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
         path = str(base / "suur-things-mcp" / "security.sqlite")
     return SecurityStore(path)
+
+
+def service_secret(name: str, env_name: str) -> str | None:
+    """Read a launchd-safe secret file, with an env fallback for local development.
+
+    Installations set only ``SUUR_SECRET_DIR`` on their LaunchAgent.  Secret
+    values stay in regular 0600 files under that private directory and therefore
+    never appear in a plist command line or process arguments.
+    """
+    explicit = os.environ.get(f"{env_name}_FILE")
+    root = Path(os.environ.get("SUUR_SECRET_DIR") or Path.home() / ".config" / "suur-things-mcp" / "secrets")
+    path = Path(explicit) if explicit else root / name
+    try:
+        st = path.lstat()
+        if not path.is_file() or stat.S_IMODE(st.st_mode) != 0o600:
+            raise OSError("service secret must be a regular 0600 file")
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    except OSError:
+        pass
+    return os.environ.get(env_name) or None
