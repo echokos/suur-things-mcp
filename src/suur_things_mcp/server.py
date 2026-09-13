@@ -10,6 +10,7 @@ Env:  THINGS_AUTH_TOKEN      required only for update/complete/cancel/schedule
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -1029,6 +1030,24 @@ def main() -> None:
         open_browser = "--no-open" not in args[1:]
         serve_foreground(app_mode=app_mode, open_browser=open_browser)
     else:
+        # Stdio MCP is deny-by-default. A profile gets only its explicitly
+        # provisioned capabilities; omitted/revoked credentials expose reads only.
+        from .security import default_store
+
+        scopes = default_store().mcp_scopes(os.environ.get("SUUR_MCP_PROFILE", ""), os.environ.get("SUUR_MCP_TOKEN"))
+        grants = {
+            "read": {"get_today", "get_inbox", "get_upcoming", "get_anytime", "get_someday", "get_logbook", "get_deadlines", "get_trash", "search_todos", "list_todos", "get_projects", "get_areas", "get_tags", "get_item", "overview", "show"},
+            "create": {"add_todo", "add_project"},
+            "update": {"update_todo", "update_project"},
+            "complete": {"complete_todo"},
+            "move": {"update_todo"},
+            "schedule": {"schedule_todo"},
+            "checklist": {"add_checklist_items"},
+        }
+        allowed = set().union(*(grants.get(scope, set()) for scope in scopes))
+        for tool in asyncio.run(mcp.list_tools()):
+            if tool.name not in allowed:
+                mcp.remove_tool(tool.name)
         mcp.run()
 
 

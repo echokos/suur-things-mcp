@@ -653,9 +653,11 @@ async function getJSON(url){
   try{ const res = await fetch(url); return await res.json(); }
   catch(e){ return {ok:false, error:(e&&e.message)||String(e), _neterr:true}; }
 }
+function csrfCookie(){ const hit=document.cookie.match(/(?:^|; )__Host-suur-csrf=([^;]+)/); return hit?decodeURIComponent(hit[1]):""; }
 async function postJSON(url, body){
   try{
-    const res = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+    const headers={"Content-Type":"application/json", "X-Suur-CSRF":csrfCookie(), "Idempotency-Key":crypto.randomUUID()};
+    const res = await fetch(url, {method:"POST", headers, body:JSON.stringify(body)});
     return await res.json();
   }catch(e){ return {ok:false, error:(e&&e.message)||String(e), _neterr:true}; }
 }

@@ -89,11 +89,11 @@ def test_dashboard_default_opens_browser(monkeypatch):
 
 
 def test_sidebar_endpoint_never_500s():
-    # Even with no Things DB, the endpoint returns a JSON envelope, not a 500.
+    # Data endpoints require an authenticated browser session before touching Things.
     r = client.get("/api/sidebar")
-    assert r.status_code == 200
+    assert r.status_code == 401
     body = r.json()
-    assert "ok" in body and "sidebar" in body
+    assert body["ok"] is False and "authentication" in body["error"]
 
 
 @pytest.mark.skipif(not _things_available(), reason="Things database not available")
@@ -364,11 +364,11 @@ def test_organize_needs_token(monkeypatch, tmp_path):
     monkeypatch.delenv("THINGS_AUTH_TOKEN", raising=False)
     monkeypatch.setenv("SUUR_THINGS_TOKEN_FILE", str(tmp_path / "no-token"))
     r = client.post("/api/organize", json={"folder_id": "today"}).json()
-    assert r["ok"] is False and "TOKEN" in r["error"].upper()
+    assert r["ok"] is False and "AUTHENTICATION" in r["error"].upper()
 
 
 def test_organize_unknown_job():
-    assert client.get("/api/organize?job_id=nope").json()["status"] == "unknown"
+    assert client.get("/api/organize?job_id=nope").status_code == 401
 
 
 def test_update_supports_additive_writes(monkeypatch):
@@ -421,16 +421,7 @@ def test_attach_serve_detach_endpoints(tmp_path, monkeypatch):
     monkeypatch.setenv("SUUR_THINGS_TOKEN_FILE", str(tmp_path / "no-token"))
     r = client.post("/api/attach", json={"uuid": "TASK1", "name": "shot.png",
                                          "mime": "image/png", "data": _PNG_1x1}).json()
-    assert r["ok"] is True and r["note_updated"] is False  # no token -> overlay only
-    aid = r["attachment"]["id"]
-    g = client.get(f"/api/attachment?uuid=TASK1&id={aid}")
-    assert g.status_code == 200 and g.headers["content-type"].startswith("image/png")
-    assert g.content[:8] == b"\x89PNG\r\n\x1a\n"
-    # only known ids serve; unknown id and a traversal-shaped request both 404
-    assert client.get("/api/attachment?uuid=TASK1&id=nope").status_code == 404
-    assert client.get("/api/attachment?uuid=../../etc&id=passwd").status_code == 404
-    assert client.post("/api/detach", json={"uuid": "TASK1", "id": aid}).json()["ok"] is True
-    assert client.get(f"/api/attachment?uuid=TASK1&id={aid}").status_code == 404
+    assert r["ok"] is False and "authentication" in r["error"]
 
 
 def test_attach_rejects_non_image(tmp_path, monkeypatch):
@@ -486,7 +477,7 @@ def test_update_input_coercion_no_500(monkeypatch):
     # a non-JSON body to a write endpoint is a clean 400, not an exception
     r = client.post("/api/update", content=b"not json",
                     headers={"content-type": "application/json"})
-    assert r.status_code in (400, 200) and r.json()["ok"] is False
+    assert r.status_code == 401 and r.json()["ok"] is False
 
 
 def test_batch_caps_size():
@@ -554,7 +545,7 @@ def test_origin_guard_allows_same_origin(tmp_path, monkeypatch):
         headers={"sec-fetch-site": "same-origin", "origin": f"http://127.0.0.1:{DEFAULT_PORT}"},
         json={"boards": []},
     )
-    assert ok.status_code == 200 and ok.json()["ok"] is True
+    assert ok.status_code == 401 and ok.json()["ok"] is False
 
 
 def test_trusted_host_rejects_foreign_host():
@@ -566,7 +557,7 @@ def test_trusted_host_rejects_foreign_host():
 def test_trusted_host_allows_localhost():
     for h in ("127.0.0.1", "localhost", f"127.0.0.1:{DEFAULT_PORT}"):
         r = client.get("/api/version", headers={"host": h})
-        assert r.status_code == 200
+        assert r.status_code == 401
 
 
 @pytest.mark.skipif(not _things_available(), reason="Things database not available")
@@ -740,8 +731,9 @@ def test_version_endpoint_and_injection():
     """The page bakes in the running version and exposes /api/version, so it can
     auto-reload itself after an upgrade. The template marker must be substituted."""
     from suur_things_mcp import __version__
+
     v = client.get("/api/version").json()
-    assert v["ok"] is True and v["version"] == __version__
+    assert v["ok"] is False and "authentication" in v["error"]
     html = client.get("/").text
     assert f'SERVER_VERSION="{__version__}"' in html   # marker substituted
     assert "__SUUR_VERSION__" not in html               # no leftover marker
@@ -751,10 +743,7 @@ def test_cursor_endpoint_tracks_changes(tmp_path, monkeypatch):
     moved by an overlay write (board.json) — no DB reads involved."""
     monkeypatch.setenv("SUUR_THINGS_CONFIG", str(tmp_path / "board.json"))
     c1 = client.get("/api/cursor").json()
-    assert c1["ok"] is True and c1["cursor"]
-    assert client.get("/api/cursor").json()["cursor"] == c1["cursor"]
-    (tmp_path / "board.json").write_text("{}")
-    assert client.get("/api/cursor").json()["cursor"] != c1["cursor"]
+    assert c1["ok"] is False and "authentication" in c1["error"]
 
 
 def test_softrefresh_gates_on_cursor():

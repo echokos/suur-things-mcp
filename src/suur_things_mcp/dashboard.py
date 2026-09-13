@@ -32,7 +32,6 @@ import subprocess
 import threading
 import time
 import urllib.request
-import uuid as _uuid
 from importlib.resources import files as _pkg_files
 from typing import Any
 
@@ -48,7 +47,8 @@ from starlette.routing import Route
 
 from . import __version__, reads
 from . import config as boardcfg
-from . import organize as organizer
+from .grace_adapter import GraceProposalAdapter
+from .security import SecurityStore, default_store
 from .urlscheme import ThingsURLError, execute
 
 # In-memory organize jobs (single uvicorn worker). job_id -> dict.
@@ -57,9 +57,61 @@ _ORGANIZE_TTL = 1800  # evict finished jobs after 30 min
 # Guards the dedupe / global-cap / insert check-then-act, which runs in a
 # threadpool worker and races against the background _work() thread's updates.
 _ORGANIZE_LOCK = threading.Lock()
+_GRACE = GraceProposalAdapter()
 
-_ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
+_TAILSCALE_HOST = "elliotts-mac-mini.tail43b447.ts.net"
 _GITHUB_SLUG_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+
+def _allowed_hosts() -> set[str]:
+    """Strict host allowlist; loopback exists only for the local reverse proxy."""
+    configured = os.environ.get("SUUR_ALLOWED_HOSTS", _TAILSCALE_HOST)
+    hosts = {host.strip().lower() for host in configured.split(",") if host.strip()}
+    return hosts | {"127.0.0.1", "localhost"}
+
+
+def _scope_for_request(request: Request) -> str:
+    if request.method == "GET":
+        return "read"
+    path = request.url.path
+    if path == "/api/add":
+        return "create"
+    if path in {"/api/organize", "/api/grace/propose"}:
+        return "propose"
+    if path in {"/api/rename", "/api/update", "/api/attach", "/api/detach"}:
+        return "update"
+    return "update"
+
+
+class _SessionGuard(BaseHTTPMiddleware):
+    """Require a revocable scoped session for dashboard APIs, with CSRF on writes."""
+
+    def __init__(self, app, store: SecurityStore):
+        super().__init__(app)
+        self._store = store
+
+    async def dispatch(self, request: Request, call_next):
+        if not request.url.path.startswith("/api/") or request.url.path in {"/api/healthz", "/api/readyz", "/api/session"}:
+            return await call_next(request)
+        scope = _scope_for_request(request)
+        csrf = request.headers.get("X-Suur-CSRF") if request.method != "GET" else request.cookies.get("__Host-suur-csrf")
+        row = self._store.authenticate(request.cookies.get("__Host-suur-session"), csrf, scope)
+        if row is None:
+            return JSONResponse({"ok": False, "error": "authentication or scope required"}, status_code=401)
+        principal = str(row["principal"])
+        if not self._store.check_rate_limit(principal):
+            return JSONResponse({"ok": False, "error": "rate limit exceeded"}, status_code=429)
+        if request.method == "POST" and request.url.path not in {"/api/organize", "/api/grace/propose"}:
+            key = request.headers.get("Idempotency-Key")
+            if not self._store.claim_idempotency(principal, key, request.url.path, await request.body()):
+                return JSONResponse({"ok": False, "error": "missing or duplicate idempotency key"}, status_code=409)
+        request.state.principal = principal
+        request.state.session_id = str(row["session_id"])
+        response = await call_next(request)
+        if request.method == "POST":
+            target = request.query_params.get("id")
+            self._store.audit(principal, request.url.path, target, response.status_code < 400)
+        return response
 
 
 class _OriginGuard(BaseHTTPMiddleware):
@@ -162,6 +214,44 @@ async def _version(_request: Request) -> JSONResponse:
     """The running server version — the page polls this and reloads itself when it
     changes (after an upgrade), so an open window never silently runs stale code."""
     return JSONResponse({"ok": True, "version": __version__})
+
+
+_WEB_SCOPES = frozenset({"read", "create", "update", "complete", "move", "schedule", "checklist", "propose"})
+
+
+async def _create_session(request: Request) -> JSONResponse:
+    """Exchange a reverse-proxy-injected bootstrap secret for secure browser cookies."""
+    bootstrap = os.environ.get("SUUR_DASHBOARD_BOOTSTRAP_TOKEN")
+    supplied = request.headers.get("X-Suur-Bootstrap")
+    if not bootstrap or not supplied or not secrets.compare_digest(bootstrap, supplied):
+        return JSONResponse({"ok": False, "error": "bootstrap authentication required"}, status_code=401)
+    issued = request.app.state.security_store.issue_session(_WEB_SCOPES, "dashboard-browser")
+    response = JSONResponse({"ok": True, "session_id": issued.session_id, "scopes": sorted(issued.scopes)})
+    response.set_cookie("__Host-suur-session", issued.token, secure=True, httponly=True, samesite="strict", path="/")
+    # CSRF is deliberately not a credential; JS can read only this random double-submit value.
+    response.set_cookie("__Host-suur-csrf", issued.csrf, secure=True, httponly=False, samesite="strict", path="/")
+    return response
+
+
+async def _revoke_session(request: Request) -> JSONResponse:
+    request.app.state.security_store.revoke_session(request.state.session_id)
+    response = JSONResponse({"ok": True})
+    response.delete_cookie("__Host-suur-session", path="/")
+    response.delete_cookie("__Host-suur-csrf", path="/")
+    return response
+
+
+async def _healthz(_request: Request) -> JSONResponse:
+    return JSONResponse({"ok": True, "service": "suur-things-mcp"})
+
+
+async def _readyz(request: Request) -> JSONResponse:
+    try:
+        await run_in_threadpool(reads.sidebar)
+    except Exception:  # noqa: BLE001
+        # Do not leak DB paths, task contents, or tokens through an unauthenticated probe.
+        return JSONResponse({"ok": False, "reason": "Things data unavailable"}, status_code=503)
+    return JSONResponse({"ok": True, "things": "available"})
 
 
 def _change_cursor() -> str:
@@ -593,73 +683,20 @@ def _evict_jobs() -> None:
         _ORGANIZE_JOBS.pop(jid, None)
 
 
-async def _organize_post(request: Request) -> JSONResponse:
-    """Start a background 'organize folder' agent run. Returns a job_id to poll."""
-    if not _auth_token():
-        return JSONResponse({"ok": False, "error": "THINGS_AUTH_TOKEN not set (needed to apply changes)"})
+async def _organize_post(_request: Request) -> JSONResponse:
+    """Retired: generic local-agent shell-outs are deliberately unavailable."""
+    return JSONResponse({"ok": False, "error": "generic organizer removed; submit a Grace proposal instead"}, status_code=410)
+
+
+async def _grace_propose(request: Request) -> JSONResponse:
+    """Create a non-executing Grace proposal; a separate authenticated write confirms it."""
     body = await _json_body(request)
     if body is None:
         return JSONResponse({"ok": False, "error": "invalid JSON body"}, status_code=400)
-    folder_id = str(body.get("folder_id") or "")
-    workflow = str(body.get("workflow") or "organize")   # organize | triage | calm
-    if not folder_id:
-        return JSONResponse({"ok": False, "error": "missing folder_id"})
-    agent = organizer.pick_agent(boardcfg.prefs())
-    if not agent:
-        return JSONResponse({"ok": False, "error": "no agent CLI found — install Claude Code or Codex"})
-
-    # Reserve the single job slot atomically: dedupe + global-cap + insert under
-    # one lock, so two concurrent POSTs can't both pass the cap and spawn jobs.
-    # The slow I/O below runs OUTSIDE the lock; on failure we release the slot.
-    job_id = _uuid.uuid4().hex[:8]
-    with _ORGANIZE_LOCK:
-        _evict_jobs()
-        for jid, job in _ORGANIZE_JOBS.items():  # dedupe: same folder+workflow already running
-            if job.get("status") == "running" and job.get("folder_id") == folder_id and job.get("workflow") == workflow:
-                return JSONResponse({"ok": True, "job_id": jid})
-        if any(j.get("status") == "running" for j in _ORGANIZE_JOBS.values()):  # global cap of 1
-            return JSONResponse({"ok": False, "error": "another organize job is already running"})
-        _ORGANIZE_JOBS[job_id] = {"status": "running", "folder_id": folder_id, "workflow": workflow,
-                                  "ts": time.time(), "suggestions": None, "error": None, "count": 0}
-
     try:
-        cards = reads.list_items(folder_id).get("items", [])[: organizer.MAX_TASKS]
-        tasks = []
-        for c in cards:
-            full = reads.get(c["uuid"]) or {}
-            tasks.append({"uuid": c["uuid"], "title": c.get("title"),
-                          "notes": full.get("notes"), "tags": full.get("tags") or c.get("tags")})
-        if not tasks:
-            _ORGANIZE_JOBS.pop(job_id, None)  # release the reserved slot
-            return JSONResponse({"ok": False, "error": "no open tasks in this folder"})
-        obj = reads.get(folder_id)
-        title = (obj.get("title") if obj else None) or folder_id
-        existing_tags = [t.get("title") for t in reads.tags() if t.get("title")]
-        dest_names: list[str] = []
-        if workflow == "triage":   # give the agent valid filing destinations (resolved to ids client-side)
-            dest_names = [p["title"] for p in reads.projects()
-                          if p.get("status") == "incomplete" and p.get("title")] \
-                         + [a["title"] for a in reads.areas() if a.get("title")]
-    except Exception as exc:  # noqa: BLE001
-        _ORGANIZE_JOBS.pop(job_id, None)  # release the reserved slot
-        return JSONResponse({"ok": False, "error": str(exc)})
-
-    model = boardcfg.prefs().get("agent_model") or organizer.DEFAULT_MODEL
-    titles = {t["uuid"]: t.get("title") for t in tasks}   # so the review modal can name each task
-    _ORGANIZE_JOBS[job_id]["count"] = len(tasks)
-
-    def _work() -> None:
-        try:
-            sug = organizer.organize(title, tasks, existing_tags, agent, model,
-                                     workflow=workflow, projects=dest_names)
-            for s in sug:
-                s["title"] = titles.get(s["uuid"])
-            _ORGANIZE_JOBS[job_id].update(status="done", suggestions=sug, ts=time.time())
-        except Exception as exc:  # noqa: BLE001
-            _ORGANIZE_JOBS[job_id].update(status="error", error=str(exc), ts=time.time())
-
-    threading.Thread(target=_work, daemon=True, name=f"organize-{job_id}").start()
-    return JSONResponse({"ok": True, "job_id": job_id, "count": len(tasks), "agent": agent})
+        return JSONResponse({"ok": True, "proposal": _GRACE.propose(body)})
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
 
 async def _organize_get(request: Request) -> JSONResponse:
@@ -671,19 +708,24 @@ async def _organize_get(request: Request) -> JSONResponse:
 
 
 def _allowed_origins(port: int) -> set[str]:
-    """The dashboard's own origins. The browser is opened at 127.0.0.1; a user may
-    also type localhost. Both resolve to the IPv4 bind, so both are legitimate."""
-    return {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+    """Exact origin set, including the Tailscale HTTPS endpoint and local proxy only."""
+    origins = {f"https://{host}" for host in _allowed_hosts() if host not in {"127.0.0.1", "localhost"}}
+    return origins | {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
 
 
-def create_app(port: int = DEFAULT_PORT) -> Starlette:
-    return Starlette(
+def create_app(port: int = DEFAULT_PORT, security_store: SecurityStore | None = None) -> Starlette:
+    app = Starlette(
         routes=[
             Route("/", _index),
+            Route("/api/healthz", _healthz),
+            Route("/api/readyz", _readyz),
+            Route("/api/session", _create_session, methods=["POST"]),
+            Route("/api/session/revoke", _revoke_session, methods=["POST"]),
             Route("/api/version", _version),
             Route("/api/cursor", _cursor),
             Route("/api/organize", _organize_get),
             Route("/api/organize", _organize_post, methods=["POST"]),
+            Route("/api/grace/propose", _grace_propose, methods=["POST"]),
             Route("/api/sidebar", _sidebar),
             Route("/api/items", _items),
             Route("/api/item", _item),
@@ -704,10 +746,13 @@ def create_app(port: int = DEFAULT_PORT) -> Starlette:
         middleware=[
             # TrustedHost first (outermost): reject foreign Host headers before any
             # handler runs — closes DNS-rebinding for the read endpoints too.
-            Middleware(TrustedHostMiddleware, allowed_hosts=list(_ALLOWED_HOSTS), www_redirect=False),
+            Middleware(TrustedHostMiddleware, allowed_hosts=list(_allowed_hosts()), www_redirect=False),
             Middleware(_OriginGuard, allowed_origins=_allowed_origins(port)),
+            Middleware(_SessionGuard, store=security_store or default_store()),
         ],
     )
+    app.state.security_store = security_store or default_store()
+    return app
 
 
 # --- Server lifecycle -----------------------------------------------------
