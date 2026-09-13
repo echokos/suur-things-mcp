@@ -10,6 +10,8 @@ esac
 
 PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SUUR_DASHBOARD_PORT=${SUUR_DASHBOARD_PORT:-8876}
+SUUR_TAILSCALE_HTTPS_PORT=${SUUR_TAILSCALE_HTTPS_PORT:-8443}
+SUUR_ALLOWED_HOSTS=${SUUR_ALLOWED_HOSTS:-elliotts-mac-mini.tail43b447.ts.net}
 SUUR_VENV=${SUUR_VENV:-"$HOME/Library/Application Support/SUUR Things MCP/venv"}
 VENV_PARENT=$(dirname "$SUUR_VENV")
 SUUR_SECRET_DIR=${SUUR_SECRET_DIR:-"$HOME/.config/suur-things-mcp/secrets"}
@@ -19,6 +21,14 @@ case "$SUUR_HERMES_GRACE_URL" in
     https://*) ;;
     *) printf '%s\n' 'SUUR_HERMES_GRACE_URL must use HTTPS.' >&2; exit 1 ;;
 esac
+
+case "$SUUR_TAILSCALE_HTTPS_PORT" in
+    ''|*[!0-9]*) printf '%s\n' 'SUUR_TAILSCALE_HTTPS_PORT must be a numeric port.' >&2; exit 1 ;;
+esac
+[ "$SUUR_TAILSCALE_HTTPS_PORT" -ge 1 ] && [ "$SUUR_TAILSCALE_HTTPS_PORT" -le 65535 ] || {
+    printf '%s\n' 'SUUR_TAILSCALE_HTTPS_PORT must be between 1 and 65535.' >&2
+    exit 1
+}
 
 command -v uv >/dev/null 2>&1 || { printf '%s\n' 'uv is required.' >&2; exit 1; }
 command -v tailscale >/dev/null 2>&1 || { printf '%s\n' 'Tailscale is required.' >&2; exit 1; }
@@ -60,7 +70,7 @@ fi
     printf '%s\n' 'Could not derive a Tailscale browser identity; set SUUR_TAILSCALE_USERS and re-run.' >&2
     exit 1
 }
-export SUUR_SECRET_DIR SUUR_TAILSCALE_USERS SUUR_HERMES_GRACE_URL
+export SUUR_SECRET_DIR SUUR_TAILSCALE_USERS SUUR_HERMES_GRACE_URL SUUR_ALLOWED_HOSTS SUUR_TAILSCALE_HTTPS_PORT
 
 # `uv sync --locked` produces the exact dependency graph committed with this
 # checkout. The fixed service path below is a stable symlink to that venv; it is
@@ -71,7 +81,7 @@ ln -sfn "$PROJECT_DIR/.venv" "$SUUR_VENV"
 "$SUUR_VENV/bin/suur-things-mcp" dashboard --install-service --port "$SUUR_DASHBOARD_PORT"
 
 # Keep the existing :443 root route (job-hunter) untouched. SUUR gets its own
-# tailnet-only listener on :8443; never call `tailscale serve reset` here.
-tailscale serve --bg --https=8443 "http://127.0.0.1:${SUUR_DASHBOARD_PORT}"
-printf 'Private SUUR dashboard: https://%s:8443\n' "$(tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Self", {}).get("DNSName", "your-tailnet-host"))')"
+# tailnet-only listener; never call `tailscale serve reset` here.
+tailscale serve --bg --https="$SUUR_TAILSCALE_HTTPS_PORT" "http://127.0.0.1:${SUUR_DASHBOARD_PORT}"
+printf 'Private SUUR dashboard: https://%s:%s\n' "$SUUR_ALLOWED_HOSTS" "$SUUR_TAILSCALE_HTTPS_PORT"
 printf '%s\n' 'Browser sessions require an allowlisted Tailscale identity; no dashboard secret was emitted.'

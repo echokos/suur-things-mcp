@@ -548,6 +548,30 @@ def test_origin_guard_allows_same_origin(tmp_path, monkeypatch):
     assert ok.status_code == 401 and ok.json()["ok"] is False
 
 
+def test_origin_guard_accepts_configured_tailscale_https_port_and_rejects_default_port(monkeypatch):
+    """The private Serve listener is the exact allowed remote origin, not :443."""
+    host = "elliotts-mac-mini.tail43b447.ts.net"
+    monkeypatch.setenv("SUUR_ALLOWED_HOSTS", host)
+    monkeypatch.setenv("SUUR_TAILSCALE_HTTPS_PORT", "8443")
+    remote = TestClient(create_app(), base_url=f"https://{host}:8443")
+    try:
+        accepted = remote.post(
+            "/api/config",
+            headers={"sec-fetch-site": "same-origin", "origin": f"https://{host}:8443"},
+            json={"boards": []},
+        )
+        rejected = remote.post(
+            "/api/config",
+            headers={"sec-fetch-site": "same-origin", "origin": f"https://{host}"},
+            json={"boards": []},
+        )
+    finally:
+        remote.close()
+
+    assert accepted.status_code == 401
+    assert rejected.status_code == 403
+
+
 def test_trusted_host_rejects_foreign_host():
     # DNS-rebinding sends the attacker's hostname as Host; reject it on reads too.
     r = client.get("/api/version", headers={"host": "evil.example"})
@@ -672,18 +696,18 @@ def test_open_url_app_mode_prefers_chromium_then_falls_back(monkeypatch):
     monkeypatch.setattr(d.subprocess, "run", lambda args, **kw: calls.append(args))
     # A Chromium browser is installed -> launch it with --app=
     monkeypatch.setattr(d.os.path, "isdir", lambda p: "Google Chrome" in p)
-    d._open_url("http://127.0.0.1:8765", app_mode=True)
-    assert calls[-1] == ["open", "-na", "Google Chrome", "--args", "--app=http://127.0.0.1:8765"]
+    d._open_url("http://127.0.0.1:8876", app_mode=True)
+    assert calls[-1] == ["open", "-na", "Google Chrome", "--args", "--app=http://127.0.0.1:8876"]
     # No Chromium browser -> plain open (normal tab)
     calls.clear()
     monkeypatch.setattr(d.os.path, "isdir", lambda p: False)
-    d._open_url("http://127.0.0.1:8765", app_mode=True)
-    assert calls[-1] == ["open", "http://127.0.0.1:8765"]
+    d._open_url("http://127.0.0.1:8876", app_mode=True)
+    assert calls[-1] == ["open", "http://127.0.0.1:8876"]
     # app_mode off always uses a plain open even if Chromium exists
     calls.clear()
     monkeypatch.setattr(d.os.path, "isdir", lambda p: True)
-    d._open_url("http://127.0.0.1:8765", app_mode=False)
-    assert calls[-1] == ["open", "http://127.0.0.1:8765"]
+    d._open_url("http://127.0.0.1:8876", app_mode=False)
+    assert calls[-1] == ["open", "http://127.0.0.1:8876"]
 
 
 @pytest.mark.skipif(not _things_available(), reason="Things database not available")
@@ -768,6 +792,8 @@ def test_service_plist_generation():
     assert "token" not in plist.lower()
     assert "SUUR_SECRET_DIR" in plist
     assert "SUUR_TAILSCALE_USERS" in plist
+    assert "SUUR_ALLOWED_HOSTS" in plist
+    assert "SUUR_TAILSCALE_HTTPS_PORT" in plist
 
 
 def test_service_uses_installer_selected_loopback_port_and_private_grace_ingress(monkeypatch):
@@ -779,11 +805,17 @@ def test_service_uses_installer_selected_loopback_port_and_private_grace_ingress
     from suur_things_mcp import dashboard as dash
 
     monkeypatch.setenv("SUUR_HERMES_GRACE_URL", "https://grace.tailnet.example/api/suur/grace/proposals")
+    monkeypatch.setenv("SUUR_ALLOWED_HOSTS", "elliotts-mac-mini.tail43b447.ts.net")
+    monkeypatch.setenv("SUUR_TAILSCALE_HTTPS_PORT", "8443")
     cmd = dash._service_command(8766)
     assert cmd[1:] == ["dashboard", "--no-open", "--strict-port", "--port", "8766"]
     plist = dash._service_plist(cmd)
     assert "SUUR_HERMES_GRACE_URL" in plist
     assert "https://grace.tailnet.example/api/suur/grace/proposals" in plist
+    assert "SUUR_ALLOWED_HOSTS" in plist
+    assert "SUUR_TAILSCALE_HTTPS_PORT" in plist
+    assert "elliotts-mac-mini.tail43b447.ts.net" in plist
+    assert "8443" in plist
 
 
 def test_strict_service_refuses_a_port_change_that_would_break_the_proxy(monkeypatch):
@@ -800,7 +832,7 @@ def test_private_tailscale_serve_install_script_exists():
 
     script = Path(__file__).parents[1] / "scripts" / "install_private_tailscale_serve.sh"
     text = script.read_text(encoding="utf-8")
-    assert "tailscale serve --bg --https=8443" in text
+    assert 'tailscale serve --bg --https="$SUUR_TAILSCALE_HTTPS_PORT"' in text
     assert "127.0.0.1" in text
     assert "SUUR_DASHBOARD_PORT" in text
     assert "SUUR_SECRET_DIR" in text
@@ -810,7 +842,7 @@ def test_private_tailscale_serve_install_script_exists():
 
 
 def test_install_service_refuses_foreign_dashboard(monkeypatch, capsys):
-    """If something else already serves :8765 and our plist isn't installed, a
+    """If something else already serves :8876 and our plist isn't installed, a
     second KeepAlive service would fight it for the port forever — refuse."""
     from suur_things_mcp import dashboard as dash
     monkeypatch.setattr(dash, "_dashboard_alive", lambda port: True)

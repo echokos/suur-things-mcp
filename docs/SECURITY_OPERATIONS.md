@@ -4,7 +4,7 @@
 
 Run SUUR only on the Mac that hosts Things. Bind the application to `127.0.0.1`; expose it only through an HTTPS Tailscale reverse proxy for `elliotts-mac-mini.tail43b447.ts.net`. Do not publish the port to a LAN/WAN interface or use a public tunnel.
 
-The app accepts only `SUUR_ALLOWED_HOSTS` (default: the Tailscale hostname) plus loopback for the local proxy. Its origin guard requires the exact scheme, host, and port. No wildcard origins.
+The app accepts only `SUUR_ALLOWED_HOSTS` (default: the Tailscale hostname) plus loopback for the local proxy. Its remote origin guard derives the exact HTTPS listener from that host allowlist and `SUUR_TAILSCALE_HTTPS_PORT` (default `8443`); no wildcard origins or default-HTTPS-port fallback.
 
 ### Private install
 
@@ -18,6 +18,8 @@ existing `:443` root route for job-hunter:
 
 ```sh
 SUUR_DASHBOARD_PORT=8876 \
+SUUR_ALLOWED_HOSTS=elliotts-mac-mini.tail43b447.ts.net \
+SUUR_TAILSCALE_HTTPS_PORT=8443 \
 SUUR_HERMES_GRACE_URL=https://grace-host.tailnet.ts.net:8444/api/suur/grace/proposals \
 scripts/install_private_tailscale_serve.sh
 ```

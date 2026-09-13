@@ -39,6 +39,19 @@ def _callback(url: str) -> str:
     expected_host = os.environ.get("SUUR_GRACE_CALLBACK_HOST")
     if expected_host and parsed.hostname.casefold() != expected_host.casefold():
         raise ValueError("callback host does not match SUUR_GRACE_CALLBACK_HOST")
+    configured_port = os.environ.get("SUUR_TAILSCALE_HTTPS_PORT", "8443")
+    try:
+        expected_port = int(configured_port)
+    except ValueError as exc:
+        raise ValueError("SUUR_TAILSCALE_HTTPS_PORT must be an integer port") from exc
+    if not 1 <= expected_port <= 65535:
+        raise ValueError("SUUR_TAILSCALE_HTTPS_PORT must be between 1 and 65535")
+    try:
+        actual_port = parsed.port
+    except ValueError as exc:
+        raise ValueError("callback must use a valid port") from exc
+    if actual_port != expected_port:
+        raise ValueError("callback port does not match SUUR_TAILSCALE_HTTPS_PORT")
     return url
 
 

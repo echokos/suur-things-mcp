@@ -20,7 +20,7 @@ uv run suur-things-mcp dashboard       # run the dashboard (add --app for app wi
 
 Data-route tests skip automatically when Things isn't installed (CI runs on Linux); URL-building and dashboard-route tests run everywhere.
 
-The dashboard may already be running on port 8765 as a launchd KeepAlive service (`dashboard --install-service`). Never start a competing foreground instance on that port — `ensure_running` reuses a live instance, and a port conflict causes a browser-open loop. Tests already pick random free ports.
+The dashboard may already be running on port 8876 as a launchd KeepAlive service (`dashboard --install-service`). Never start a competing foreground instance on that port — `ensure_running` reuses a live instance, and a port conflict causes a browser-open loop. Tests already pick random free ports.
 
 ## The core invariant
 

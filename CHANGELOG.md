@@ -47,7 +47,7 @@ follows [Keep a Changelog](https://keepachangelog.com/); this project uses
   Full items via `compact=false`, full detail for one item via `get_item`.
 - **`dashboard --install-service` / `--uninstall-service`** — installs a launchd
   KeepAlive LaunchAgent running `dashboard --no-open`, so the board is always
-  live at :8765 with no terminal and no browser tab popping on restarts. Refuses
+  live at :8876 with no terminal and no browser tab popping on restarts. Refuses
   to install when a foreign process already serves the port.
 - **Poll change detection.** The dashboard's 25s auto-refresh first checks a new
   `/api/cursor` endpoint (mtime/size of the DB, its WAL, and board.json — a few

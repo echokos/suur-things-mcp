@@ -87,7 +87,7 @@ help of your own agent, reviewed before anything is written.
 - ✅ Dashboard auto-refresh (25s poll; pauses during edit/drag/filter/search and in
   background tabs; preserves scroll position).
 - ✅ Drag a task onto **Today / Anytime / Someday** in the sidebar to reschedule (`when=`).
-- ✅ Stable dashboard port — reuses a live instance and rebinds 8765 through TIME_WAIT
+- ✅ Stable dashboard port — reuses a live instance and rebinds 8876 through TIME_WAIT
   (`SO_REUSEADDR`); only falls back to a random port if a *foreign* process holds it.
 
 ## Dashboard affordances ✅ (shipped)

@@ -76,7 +76,7 @@ Reduced motion (append selectors to the plan-000 media block):
 
 - **Mechanical**: `uv run pytest -q` — all pass (browser tests exercise the
   quick-add card end-to-end).
-- **Feel check** (fresh foreground dashboard, not the :8765 service):
+- **Feel check** (fresh foreground dashboard, not the :8876 service):
   - Click a task: the card settles in — a fast, small scale+rise, no bounce.
   - DevTools Animations panel at 10% speed: the card never starts from
     invisible-small (`scale(0.97)`, not `scale(0)`), origin center (correct

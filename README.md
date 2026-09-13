@@ -17,7 +17,7 @@ An [MCP](https://modelcontextprotocol.io) server for **Things 3** (Cultured Code
 claude mcp add suurthings -- uvx suur-things-mcp
 ```
 
-Now ask your agent **"What should I work on today?"** — it reads your real Things lists and answers. Reads work immediately, no token. (Optional: `uvx suur-things-mcp dashboard` opens a local board at http://127.0.0.1:8765.) Add a token — see below — only when you want the agent to *modify* existing tasks.
+Now ask your agent **"What should I work on today?"** — it reads your real Things lists and answers. Reads work immediately, no token. (Optional: `uvx suur-things-mcp dashboard` opens a local board at http://127.0.0.1:8876.) Add a token — see below — only when you want the agent to *modify* existing tasks.
 
 ---
 
@@ -42,7 +42,7 @@ Because Cultured Code says not to. Their [AI-integration guidance](https://cultu
 
 ## ✨ Beyond Things — what the dashboard adds
 
-`uvx suur-things-mcp dashboard` runs a local board (`127.0.0.1:8765`) that *looks* like Things but adds the views and superpowers it doesn't have. Everything here is layered **on top** — your Things data stays untouched (boards, priorities, time-blocks, and repo links live in a local overlay, never written to Things).
+`uvx suur-things-mcp dashboard` runs a local board (`127.0.0.1:8876`) that *looks* like Things but adds the views and superpowers it doesn't have. Everything here is layered **on top** — your Things data stays untouched (boards, priorities, time-blocks, and repo links live in a local overlay, never written to Things).
 
 **Plan & focus**
 - 🟦 **Priority Matrix** — an Eisenhower matrix (Do First / Schedule / Delegate / Don't Do) as a one-click view on *any* list, project, or area. Drag tasks (and an area's projects) into quadrants.
@@ -276,6 +276,8 @@ Three tiers — important if you switch machines:
 | `SUUR_THINGS_EDITOR` / `SUUR_THINGS_TERMINAL` | Default editor command / terminal app for repo-launch buttons |
 | `SUUR_THINGS_AGENT` | Which CLI the ✨ organize button spawns (`claude` / `codex`) |
 | `SUUR_DASHBOARD_PORT` | Port used by `scripts/install_private_tailscale_serve.sh` for both the LaunchAgent and Tailscale Serve target (default `8876`) |
+| `SUUR_ALLOWED_HOSTS` | Comma-separated trusted Tailscale hostnames (default `elliotts-mac-mini.tail43b447.ts.net`) |
+| `SUUR_TAILSCALE_HTTPS_PORT` | Private Tailscale Serve listener and exact remote origin port (default `8443`) |
 | `SUUR_HERMES_GRACE_URL` | Required HTTPS private Grace proposal ingress URL for the hardened installer; persisted as non-secret service configuration |
 
 ---

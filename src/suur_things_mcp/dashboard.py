@@ -63,6 +63,7 @@ _ORGANIZE_LOCK = threading.Lock()
 _GRACE = GraceProposalAdapter()
 
 _TAILSCALE_HOST = "elliotts-mac-mini.tail43b447.ts.net"
+_TAILSCALE_HTTPS_PORT = 8443
 _GITHUB_SLUG_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
 
@@ -71,6 +72,18 @@ def _allowed_hosts() -> set[str]:
     configured = os.environ.get("SUUR_ALLOWED_HOSTS", _TAILSCALE_HOST)
     hosts = {host.strip().lower() for host in configured.split(",") if host.strip()}
     return hosts | {"127.0.0.1", "localhost"}
+
+
+def _tailscale_https_port() -> int:
+    """Read the private Tailscale Serve port, rejecting malformed config."""
+    configured = os.environ.get("SUUR_TAILSCALE_HTTPS_PORT", str(_TAILSCALE_HTTPS_PORT))
+    try:
+        port = int(configured)
+    except ValueError as exc:
+        raise ValueError("SUUR_TAILSCALE_HTTPS_PORT must be an integer port") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("SUUR_TAILSCALE_HTTPS_PORT must be between 1 and 65535")
+    return port
 
 
 def _scope_for_request(request: Request) -> str:
@@ -866,7 +879,10 @@ async def _organize_get(request: Request) -> JSONResponse:
 
 def _allowed_origins(port: int) -> set[str]:
     """Exact origin set, including the Tailscale HTTPS endpoint and local proxy only."""
-    origins = {f"https://{host}" for host in _allowed_hosts() if host not in {"127.0.0.1", "localhost"}}
+    tailscale_port = _tailscale_https_port()
+    origins = {
+        f"https://{host}:{tailscale_port}" for host in _allowed_hosts() if host not in {"127.0.0.1", "localhost"}
+    }
     return origins | {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
 
 
@@ -1001,7 +1017,7 @@ def ensure_running(open_browser: bool = True, app_mode: bool = False) -> str:
 # --- launchd service (install/uninstall) -----------------------------------
 # Productizes the "run the dashboard as a login service" setup: a KeepAlive
 # LaunchAgent running `dashboard --no-open`, so the board is always live on
-# :8765 without a terminal or a browser tab popping on every restart.
+# :8876 without a terminal or a browser tab popping on every restart.
 
 _SERVICE_LABEL = "io.suur.things-dashboard"
 
@@ -1028,12 +1044,16 @@ def _service_plist(cmd: list[str]) -> str:
     )
     tailscale_users = os.environ.get("SUUR_TAILSCALE_USERS", "")
     grace_url = os.environ.get("SUUR_HERMES_GRACE_URL", "")
+    allowed_hosts = os.environ.get("SUUR_ALLOWED_HOSTS", _TAILSCALE_HOST)
+    tailscale_https_port = str(_tailscale_https_port())
     environment = "\n".join(
         f"    <key>{name}</key><string>{escape(value)}</string>"
         for name, value in (
             ("SUUR_SECRET_DIR", secret_dir),
             ("SUUR_TAILSCALE_USERS", tailscale_users),
             ("SUUR_HERMES_GRACE_URL", grace_url),
+            ("SUUR_ALLOWED_HOSTS", allowed_hosts),
+            ("SUUR_TAILSCALE_HTTPS_PORT", tailscale_https_port),
         )
     )
     return f"""<?xml version="1.0" encoding="UTF-8"?>

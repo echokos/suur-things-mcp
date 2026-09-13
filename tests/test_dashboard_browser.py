@@ -140,7 +140,7 @@ def _tailscale_dashboard_context(browser, tmp_path, monkeypatch, login):
     """Serve the real page at the Tailscale HTTPS origin while dispatching API
     calls through the real ASGI app. This permits Secure __Host cookies in a
     browser without binding a test TLS listener or requiring Things on Linux."""
-    origin = "https://elliotts-mac-mini.tail43b447.ts.net"
+    origin = "https://elliotts-mac-mini.tail43b447.ts.net:8443"
     monkeypatch.setenv("SUUR_TAILSCALE_USERS", "elliott@example.com")
     backend = TestClient(create_app(security_store=SecurityStore(tmp_path / "security.sqlite")), base_url=origin)
     context = browser.new_context()

@@ -95,7 +95,7 @@ handling. Every later plan needs these three things in place.
   — all pass (the browser tests open real overlays; `openCreate('todo')` must
   still show the card and `#f-title` must be focusable/visible).
 - **Feel check**: `uv run suur-things-mcp dashboard` on a random port
-  (`SUUR: use a fresh foreground run, NOT the :8765 service`), then:
+  (`SUUR: use a fresh foreground run, NOT the :8876 service`), then:
   - Click ＋: the dim backdrop fades in over ~200ms instead of popping.
   - Press Escape: it fades out; nothing is clickable behind it mid-fade.
   - With nothing open, click through the page — no dead zone (the always-flex

@@ -102,6 +102,24 @@ def test_private_grace_ingress_has_a_fixed_local_runtime_contract():
     assert "127.0.0.1" in result.stdout
 
 
+def test_grace_decision_callback_uses_configured_tailscale_https_port(monkeypatch):
+    """The decision adapter may target only the private :8443 Serve listener."""
+    script = os.path.join(os.path.dirname(__file__), "..", "scripts", "grace_hermes_decide.py")
+    spec = importlib.util.spec_from_file_location("grace_decide", script)
+    assert spec and spec.loader
+    decide = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(decide)
+
+    host = "elliotts-mac-mini.tail43b447.ts.net"
+    monkeypatch.setenv("SUUR_GRACE_CALLBACK_HOST", host)
+    monkeypatch.setenv("SUUR_TAILSCALE_HTTPS_PORT", "8443")
+    callback = f"https://{host}:8443/api/grace/decision"
+
+    assert decide._callback(callback) == callback
+    with pytest.raises(ValueError, match="port"):
+        decide._callback(f"https://{host}/api/grace/decision")
+
+
 def test_private_grace_ingress_verifies_and_spools_a_signed_proposal(tmp_path):
     script = os.path.join(os.path.dirname(__file__), "..", "scripts", "grace_hermes_ingress.py")
     spec = importlib.util.spec_from_file_location("grace_ingress", script)
@@ -163,7 +181,7 @@ def test_dashboard_uses_secure_revocable_scoped_session_with_csrf(tmp_path, monk
     store = SecurityStore(tmp_path / "security.sqlite")
     client = TestClient(
         create_app(security_store=store),
-        base_url="https://elliotts-mac-mini.tail43b447.ts.net",
+        base_url="https://elliotts-mac-mini.tail43b447.ts.net:8443",
     )
 
     assert client.get("/api/sidebar").status_code == 401
@@ -232,7 +250,7 @@ def test_dashboard_accepts_only_allowlisted_tailscale_identity_for_browser_boots
     store = SecurityStore(tmp_path / "security.sqlite")
     client = TestClient(
         create_app(security_store=store),
-        base_url="https://elliotts-mac-mini.tail43b447.ts.net",
+        base_url="https://elliotts-mac-mini.tail43b447.ts.net:8443",
     )
 
     unauthorized = client.post(

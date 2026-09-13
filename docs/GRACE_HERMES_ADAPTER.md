@@ -74,15 +74,16 @@ the authenticated workflow:
 
 ```sh
 SUUR_GRACE_CALLBACK_HOST=elliotts-mac-mini.tail43b447.ts.net \
+SUUR_TAILSCALE_HTTPS_PORT=8443 \
 SUUR_GRACE_SHARED_KEY_FILE=/path/in/grace-secret-store/grace-shared-key \
 python3 /fixed/suur-checkout/scripts/grace_hermes_decide.py \
   --proposal-id "$PROPOSAL_ID" --decision-id "$DECISION_ID" --approve \
-  --callback-url https://elliotts-mac-mini.tail43b447.ts.net/api/grace/decision
+  --callback-url https://elliotts-mac-mini.tail43b447.ts.net:8443/api/grace/decision
 ```
 
 For a rejection, replace `--approve` with `--deny`. The adapter fixes
 `profile=grace` and `scopes=["update"]`, signs the exact body with HMAC-SHA256,
-requires HTTPS, and optionally pins the callback host. It never accepts a
+requires HTTPS and the configured Tailscale Serve port, and optionally pins the callback host. It never accepts a
 callback URL from task notes or browser content. The SUUR server rejects stale
 callbacks (more than five minutes old), unsigned decisions, duplicate decision
 IDs, decisions for another profile, decisions without `update`, and attempts to
