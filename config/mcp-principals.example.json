@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "default": {"scopes": ["read"], "destructive_tools": false},
+  "principals": [
+    {"profile": "grace", "scopes": ["read"], "issue_separate_revocable_credential": true},
+    {"profile": "<operational-profile>", "scopes": ["read"], "issue_separate_revocable_credential": true}
+  ],
+  "explicit_request_scope_grants": ["create", "update", "complete", "move", "schedule", "checklist"],
+  "excluded_profile_classes": ["personal-only"]
+}

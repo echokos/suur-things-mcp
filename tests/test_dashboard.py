@@ -72,7 +72,7 @@ def test_dashboard_no_open_flag_suppresses_browser(monkeypatch):
     monkeypatch.setattr(dash, "serve_foreground", lambda **kw: captured.update(kw))
     monkeypatch.setattr(sys, "argv", ["suur-things-mcp", "dashboard", "--no-open"])
     server.main()
-    assert captured == {"port": 8765, "app_mode": False, "open_browser": False, "strict_port": False}
+    assert captured == {"port": 8876, "app_mode": False, "open_browser": False, "strict_port": False}
 
 
 def test_dashboard_default_opens_browser(monkeypatch):
@@ -759,7 +759,7 @@ def test_service_plist_generation():
     dir); the command must run headlessly and pin the configured service port."""
     from suur_things_mcp import dashboard as dash
     cmd = dash._service_command()
-    assert cmd[1:] == ["dashboard", "--no-open", "--strict-port", "--port", "8765"]
+    assert cmd[1:] == ["dashboard", "--no-open", "--strict-port", "--port", "8876"]
     assert cmd[0].endswith("/venv/bin/suur-things-mcp")
     assert "uvx" not in cmd[0]
     plist = dash._service_plist(cmd)
@@ -800,7 +800,7 @@ def test_private_tailscale_serve_install_script_exists():
 
     script = Path(__file__).parents[1] / "scripts" / "install_private_tailscale_serve.sh"
     text = script.read_text(encoding="utf-8")
-    assert "tailscale serve --https=443" in text
+    assert "tailscale serve --bg --https=8443" in text
     assert "127.0.0.1" in text
     assert "SUUR_DASHBOARD_PORT" in text
     assert "SUUR_SECRET_DIR" in text
@@ -834,7 +834,7 @@ def test_main_dispatches_service_flags(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["suur-things-mcp", "dashboard", "--uninstall-service"])
     with pytest.raises(SystemExit):
         server.main()
-    assert called == [("install", 8765), "uninstall"]
+    assert called == [("install", 8876), "uninstall"]
 
 # --- motion + UX feature source guards (same style as the quick-add guards) ---
 

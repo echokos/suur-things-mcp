@@ -11,17 +11,18 @@ The app accepts only `SUUR_ALLOWED_HOSTS` (default: the Tailscale hostname) plus
 Run `scripts/install_private_tailscale_serve.sh` **locally on the Things Mac**. It uses
 `uv sync --locked --no-dev`, exposes a fixed service executable at
 `~/Library/Application Support/SUUR Things MCP/venv/bin/suur-things-mcp`, installs the
-LaunchAgent, and configures `tailscale serve --https=443` to proxy only to
-the explicitly selected loopback port. The following selects `8766` (choose one free
-port before installation, then keep the service and proxy on that same value):
+LaunchAgent, and configures Tailscale Serve to proxy only to the explicitly selected
+loopback port. The live-Mac deployment default is `8876`;
+it is exposed only on a distinct tailnet HTTPS listener `:8443`, preserving the
+existing `:443` root route for job-hunter:
 
 ```sh
-SUUR_DASHBOARD_PORT=8766 \
-SUUR_HERMES_GRACE_URL=https://grace-host.tailnet.ts.net/api/suur/grace/proposals \
+SUUR_DASHBOARD_PORT=8876 \
+SUUR_HERMES_GRACE_URL=https://grace-host.tailnet.ts.net:8444/api/suur/grace/proposals \
 scripts/install_private_tailscale_serve.sh
 ```
 
-The LaunchAgent runs `dashboard --no-open --strict-port --port 8766`; it refuses to
+The LaunchAgent runs `dashboard --no-open --strict-port --port 8876`; it refuses to
 fall back to a different port because that would detach the private proxy from the
 dashboard. The LaunchAgent never invokes `uvx` or resolves a package at startup.
 

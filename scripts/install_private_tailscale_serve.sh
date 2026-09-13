@@ -9,7 +9,7 @@ case "$(uname -s)" in
 esac
 
 PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-SUUR_DASHBOARD_PORT=${SUUR_DASHBOARD_PORT:-8765}
+SUUR_DASHBOARD_PORT=${SUUR_DASHBOARD_PORT:-8876}
 SUUR_VENV=${SUUR_VENV:-"$HOME/Library/Application Support/SUUR Things MCP/venv"}
 VENV_PARENT=$(dirname "$SUUR_VENV")
 SUUR_SECRET_DIR=${SUUR_SECRET_DIR:-"$HOME/.config/suur-things-mcp/secrets"}
@@ -70,8 +70,8 @@ mkdir -p "$VENV_PARENT"
 ln -sfn "$PROJECT_DIR/.venv" "$SUUR_VENV"
 "$SUUR_VENV/bin/suur-things-mcp" dashboard --install-service --port "$SUUR_DASHBOARD_PORT"
 
-# Tailscale Serve terminates HTTPS inside this tailnet and proxies to loopback.
-# Do not replace this with Funnel or a LAN/WAN bind.
-tailscale serve --https=443 "http://127.0.0.1:${SUUR_DASHBOARD_PORT}"
-printf 'Private SUUR dashboard: https://%s\n' "$(tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Self", {}).get("DNSName", "your-tailnet-host"))')"
+# Keep the existing :443 root route (job-hunter) untouched. SUUR gets its own
+# tailnet-only listener on :8443; never call `tailscale serve reset` here.
+tailscale serve --bg --https=8443 "http://127.0.0.1:${SUUR_DASHBOARD_PORT}"
+printf 'Private SUUR dashboard: https://%s:8443\n' "$(tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Self", {}).get("DNSName", "your-tailnet-host"))')"
 printf '%s\n' 'Browser sessions require an allowlisted Tailscale identity; no dashboard secret was emitted.'

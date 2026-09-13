@@ -1030,7 +1030,7 @@ def main() -> None:
     args = sys.argv[1:]
     if args and args[0] == "dashboard":
         dashboard_args = args[1:]
-        port = 8765
+        port = 8876
         if "--port" in dashboard_args:
             position = dashboard_args.index("--port")
             try:

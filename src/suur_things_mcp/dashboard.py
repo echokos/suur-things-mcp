@@ -146,7 +146,7 @@ class _OriginGuard(BaseHTTPMiddleware):
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         return response
 
-DEFAULT_PORT = 8765
+DEFAULT_PORT = 8876
 _running: dict[str, Any] = {}
 
 

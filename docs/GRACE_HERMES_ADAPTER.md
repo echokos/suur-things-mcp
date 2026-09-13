@@ -34,27 +34,32 @@ overrides it before installation.
 Grace's Hermes runtime receives proposals through the checked-in
 `scripts/grace_hermes_ingress.py` service. It binds **only** to `127.0.0.1`,
 verifies the SUUR `timestamp.body` HMAC envelope with the transferred 0600 key,
-rejects stale/invalid/replayed requests, and atomically writes accepted proposal
-JSON to a 0700 local spool. The local Grace workflow consumes that spool as data;
-it must not execute proposal titles, notes, or task content.
+uses the real configured `grace` profile via `hermes chat --max-turns 1`, and
+returns an HMAC-authenticated non-mutating chat response. Duplicate proposals
+reuse their persisted response; concurrent retries return `processing`. Proposal
+content is data, not instructions, and the adapter cannot approve, deny, or
+modify Things.
 
-On Grace's Mac, run the ingress behind Tailscale Serve (not Funnel or a public
-proxy). This example selects loopback port `8790` for that host:
+On the Linux Grace host, install `deploy/grace-hermes-ingress.service` and
+`deploy/grace-hermes-ingress.env.example` as `/etc/systemd/system/` and
+`/etc/suur-grace-ingress.env` (mode 0600). The unit uses the actual Grace profile
+home and starts the bounded `hermes chat` invocation; it is not a generic Hermes
+webhook. Run the ingress behind Tailscale Serve (not Funnel or a public proxy):
 
 ```sh
-python3 /fixed/suur-checkout/scripts/grace_hermes_ingress.py \
-  --port 8790 \
-  --shared-key-file /path/in/grace-secret-store/grace-shared-key \
-  --spool-dir ~/.config/grace-hermes/suur-proposals
-
-tailscale serve --https=443 http://127.0.0.1:8790
+sudo systemctl daemon-reload
+sudo systemctl enable --now grace-hermes-ingress
+tailscale serve --bg --https=8444 http://127.0.0.1:8790
+python3 /fixed/suur-checkout/scripts/smoke_grace_hermes_ingress.py \
+  --url https://grace-host.tailnet.ts.net:8444/api/suur/grace/proposals \
+  --shared-key-file /etc/suur-grace-ingress/grace-shared-key
 ```
 
 Set `SUUR_HERMES_GRACE_URL` on the Things Mac to the resulting private Tailscale
 HTTPS URL, including the fixed path:
 
 ```sh
-export SUUR_HERMES_GRACE_URL=https://grace-host.tailnet.ts.net/api/suur/grace/proposals
+export SUUR_HERMES_GRACE_URL=https://grace-host.tailnet.ts.net:8444/api/suur/grace/proposals
 ```
 
 The SUUR installer persists this non-secret URL in its LaunchAgent so proposal

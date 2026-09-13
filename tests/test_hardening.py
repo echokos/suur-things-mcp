@@ -113,7 +113,11 @@ def test_private_grace_ingress_verifies_and_spools_a_signed_proposal(tmp_path):
     key_file.write_text("grace-shared-secret\n", encoding="utf-8")
     key_file.chmod(0o600)
     spool_dir = tmp_path / "spool"
-    server = ingress.ThreadingHTTPServer(("127.0.0.1", 0), ingress._handler(ingress._secret(key_file), spool_dir))
+    fake_hermes = tmp_path / "hermes"
+    fake_hermes.write_text("#!/bin/sh\nprintf '%s\\n' 'Grace received the proposal.'\n", encoding="utf-8")
+    fake_hermes.chmod(0o700)
+    runtime = ingress.HermesRuntime(str(fake_hermes), tmp_path / "grace", spool_dir, 3)
+    server = ingress.ThreadingHTTPServer(("127.0.0.1", 0), ingress._handler(ingress._secret(key_file), runtime))
     thread = threading.Thread(target=server.handle_request)
     thread.start()
     try:
@@ -132,6 +136,12 @@ def test_private_grace_ingress_verifies_and_spools_a_signed_proposal(tmp_path):
         )
         with urllib.request.urlopen(request, timeout=3) as response:
             assert response.status == 202
+            reply = response.read()
+            assert response.headers["X-Grace-Signature"] == hmac.new(
+                b"grace-shared-secret",
+                f"{response.headers['X-Grace-Timestamp']}.".encode() + reply,
+                hashlib.sha256,
+            ).hexdigest()
     finally:
         thread.join(timeout=3)
         server.server_close()
