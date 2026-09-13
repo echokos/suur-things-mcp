@@ -706,6 +706,22 @@ function ring(p){ const r=6,c=2*Math.PI*r,off=c*(1-p);
   if(p<=0) return `<svg class="ring" width="16" height="16" viewBox="0 0 16 16"><circle class="ring-bg" cx="8" cy="8" r="6"/></svg>`;
   return `<svg class="ring" width="16" height="16" viewBox="0 0 16 16"><circle class="ring-bg" cx="8" cy="8" r="6"/><circle class="ring-fg" cx="8" cy="8" r="6" stroke-dasharray="${c.toFixed(2)}" stroke-dashoffset="${off.toFixed(2)}" transform="rotate(-90 8 8)"/></svg>`; }
 
+async function bootstrapSession(){
+  // The dashboard API is session-gated. Bootstrap from the authenticated Tailscale
+  // browser context before reading config/sidebar; never put a bootstrap secret in
+  // page code or silently continue as an unauthenticated, half-working dashboard.
+  try{
+    const res=await fetch("/api/session", {method:"POST", credentials:"same-origin"});
+    const data=await res.json();
+    if(!res.ok || !data.ok) throw new Error(data.error||"session bootstrap was rejected");
+    return true;
+  }catch(e){
+    const message=(e&&e.message)||String(e);
+    $("#side-nav").innerHTML=`<div class="err">Dashboard access was not authorized.</div>`;
+    $("#content").innerHTML=`<div class="err">Dashboard access was not authorized: ${esc(message)}</div>`;
+    return false;
+  }
+}
 async function loadConfig(){ CONFIG=(await getJSON("/api/config")).config; }
 // Save only the sections this client owns in this action, so a concurrent edit
 // (CLI / another tab) to a different section is never clobbered.
@@ -2100,7 +2116,7 @@ function wireStatic(){
   on("#b-delete",deleteBoard);
 }
 
-(async()=>{ wireStatic(); buildSelBar(); await loadConfig(); await loadSidebar(); route();
+(async()=>{ wireStatic(); buildSelBar(); if(!(await bootstrapSession())) return; await loadConfig(); await loadSidebar(); route();
   // Seed the change cursor so the first poll doesn't trigger a pointless refresh.
   getJSON("/api/cursor").then(d=>{ if(d&&d.ok) LAST_CURSOR=d.cursor; });
   // Near-live: the cursor check is ~3 stat() calls server-side, so poll often —

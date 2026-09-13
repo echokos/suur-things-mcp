@@ -10,6 +10,7 @@ They skip cleanly when Playwright's Chromium isn't installed, so plain
 browser and runs them for real.
 """
 
+import json
 import socket
 import threading
 import time
@@ -130,6 +131,68 @@ def test_page_loads_without_js_exceptions(browser, dashboard_url):
     pg.goto(dashboard_url, wait_until="networkidle")
     pg.close()
     assert not errors, f"uncaught JS exceptions on load: {errors}"
+
+
+def test_startup_bootstraps_session_before_protected_api_calls(browser, dashboard_url):
+    """The real page must establish its cookie-backed session before config or
+    sidebar reads. Route fulfillment keeps this browser test independent of a
+    local Things database while still exercising the shipped startup script."""
+    context = browser.new_context()
+    calls = []
+
+    def api(route):
+        url = route.request.url
+        if url.endswith("/api/session"):
+            calls.append("session")
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"ok": True}))
+        elif url.endswith("/api/config"):
+            calls.append("config")
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"ok": True, "config": {"boards": []}}))
+        elif url.endswith("/api/sidebar"):
+            calls.append("sidebar")
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({"ok": True, "auth": False, "sidebar": {"builtins": [], "areas": [], "arealess": []}}),
+            )
+        elif url.endswith("/api/cursor"):
+            calls.append("cursor")
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"ok": True, "cursor": "test"}))
+        else:
+            route.abort()
+
+    context.route("**/api/**", api)
+    page = context.new_page()
+    page.goto(dashboard_url, wait_until="networkidle")
+    page.close()
+    context.close()
+
+    assert calls[:3] == ["session", "config", "sidebar"]
+
+
+def test_startup_stops_and_shows_error_when_session_is_rejected(browser, dashboard_url):
+    """An unauthenticated browser gets a visible denial, not a dashboard that
+    proceeds into protected endpoints and fails later in unrelated ways."""
+    context = browser.new_context()
+    calls = []
+
+    def api(route):
+        calls.append(route.request.url.rsplit("/", 1)[-1])
+        route.fulfill(
+            status=401,
+            content_type="application/json",
+            body=json.dumps({"ok": False, "error": "bootstrap authentication required"}),
+        )
+
+    context.route("**/api/**", api)
+    page = context.new_page()
+    page.goto(dashboard_url, wait_until="networkidle")
+    content = page.locator("#content").inner_text()
+    page.close()
+    context.close()
+
+    assert calls == ["session"]
+    assert "Dashboard access was not authorized" in content
 
 
 def test_create_card_title_field_is_visible(page):
