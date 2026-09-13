@@ -32,6 +32,13 @@ def test_index_route_is_static():
     assert 'id="sidebar"' in r.text and "/api/sidebar" in r.text
 
 
+def test_fork_branding_stays_things_only():
+    """Keep Elliott's visible fork branding across upstream upgrades."""
+    html = client.get("/").text
+    assert '<div class="brand">Things</div>' in html
+    assert '<div class="brand">SUUR THINGS</div>' not in html
+
+
 def test_quick_add_has_feedback_and_guards():
     """The quick-add submit path must keep its no-silent-failure guards: a
     re-entry lock, a button-disable/restore, and a try/catch around the request.
